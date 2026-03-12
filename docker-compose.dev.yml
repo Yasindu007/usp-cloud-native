@@ -1,0 +1,116 @@
+# ============================================================
+# URL Shortener Platform — Local Development Infrastructure
+# Simulates production data layer: PostgreSQL + Redis
+# ============================================================
+
+version: '3.9'
+
+services:
+  # ----------------------------------------------------------
+  # PostgreSQL 16 — Primary (Phase 1: single node, replica added in Phase 2)
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: urlshortener-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-urlshortener}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_DB: ${POSTGRES_DB:-urlshortener}
+      # Tuning for local dev — not production values
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-urlshortener} -d ${POSTGRES_DB:-urlshortener}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - shortener-dev
+    command: >
+      postgres
+        -c log_statement=all
+        -c log_min_duration_statement=100
+        -c shared_preload_libraries=pg_stat_statements
+        -c max_connections=100
+        -c shared_buffers=128MB
+
+  # ----------------------------------------------------------
+  # Redis 7.2 — Single node for Phase 1 (cluster added in Phase 4)
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: urlshortener-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD:-secret}
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1
+        --loglevel notice
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - shortener-dev
+
+  # ----------------------------------------------------------
+  # Redis Insight — GUI for Redis inspection (dev only)
+  # ----------------------------------------------------------
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: urlshortener-redis-insight
+    restart: unless-stopped
+    ports:
+      - "5540:5540"
+    networks:
+      - shortener-dev
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - tools
+
+  # ----------------------------------------------------------
+  # pgAdmin — GUI for PostgreSQL inspection (dev only)
+  # ----------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: urlshortener-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    networks:
+      - shortener-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  shortener-dev:
+    driver: bridge
+    name: urlshortener-dev
