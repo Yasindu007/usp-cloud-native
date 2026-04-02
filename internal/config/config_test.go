@@ -1,7 +1,6 @@
 package config_test
 
 import (
-	"os"
 	"testing"
 
 	"github.com/urlshortener/platform/internal/config"
@@ -103,7 +102,15 @@ func TestConfig_EnvironmentHelpers(t *testing.T) {
 	clearEnv(t)
 
 	t.Setenv("ENVIRONMENT", "production")
-	cfg, _ := config.Load()
+	t.Setenv("DB_PRIMARY_DSN", "postgres://primary")
+	t.Setenv("DB_REPLICA_DSN", "postgres://replica")
+	t.Setenv("JWT_ISSUER", "test-issuer")
+	t.Setenv("JWT_PUBLIC_KEY_PATH", "test-public.pem")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading production config: %v", err)
+	}
 	if !cfg.IsProduction() {
 		t.Error("expected IsProduction()=true")
 	}
