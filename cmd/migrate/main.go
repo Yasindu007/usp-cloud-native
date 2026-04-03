@@ -28,11 +28,17 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/urlshortener/platform/internal/config"
 )
 
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
+		os.Exit(1)
+	}
+
+	if err := config.LoadDotEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: loading .env: %v\n", err)
 		os.Exit(1)
 	}
 

@@ -10,9 +10,11 @@
 package config
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -88,6 +90,10 @@ type Config struct {
 // that required variables are set. Returns an error if validation fails
 // so the caller can exit immediately (fail-fast principle).
 func Load() (*Config, error) {
+	if err := LoadDotEnv(); err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		// Service identity
 		ServiceName:    getEnv("SERVICE_NAME", "url-shortener-api"),
@@ -155,6 +161,69 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LoadDotEnv loads environment variables from the nearest .env file found in
+// the current directory or its parents. Existing environment variables win.
+func LoadDotEnv() error {
+	if os.Getenv("CONFIG_DISABLE_DOTENV") == "1" {
+		return nil
+	}
+
+	path, err := findDotEnv()
+	if err != nil || path == "" {
+		return nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open .env: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return fmt.Errorf("parse .env %s:%d: expected KEY=VALUE", path, lineNo)
+		}
+
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return fmt.Errorf("parse .env %s:%d: empty key", path, lineNo)
+		}
+
+		if os.Getenv(key) != "" {
+			continue
+		}
+
+		value = strings.TrimSpace(value)
+		value = stripInlineComment(value)
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("set env %s from .env: %w", key, err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read .env: %w", err)
+	}
+
+	return nil
 }
 
 // validate performs semantic validation on the loaded configuration.
@@ -261,4 +330,53 @@ func getEnvFloat(key string, defaultVal float64) float64 {
 		return defaultVal
 	}
 	return f
+}
+
+func findDotEnv() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+
+	for {
+		candidate := filepath.Join(dir, ".env")
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, nil
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("stat .env: %w", err)
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+		dir = parent
+	}
+}
+
+func stripInlineComment(value string) string {
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '#':
+			if inSingle || inDouble {
+				continue
+			}
+			if i == 0 || value[i-1] == ' ' || value[i-1] == '\t' {
+				return strings.TrimSpace(value[:i])
+			}
+		}
+	}
+
+	return value
 }

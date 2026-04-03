@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/urlshortener/platform/internal/config"
@@ -119,10 +121,51 @@ func TestConfig_EnvironmentHelpers(t *testing.T) {
 	}
 }
 
+func TestLoad_DotEnvFallbackAndEnvPrecedence(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("CONFIG_DISABLE_DOTENV", "")
+
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env")
+	envBody := "API_PORT=7070\nREDIS_PASSWORD=secret\nLOG_LEVEL=warn\n"
+	if err := os.WriteFile(envPath, []byte(envBody), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(wd)
+	})
+
+	t.Setenv("LOG_LEVEL", "debug")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.APIPort != "7070" {
+		t.Errorf("expected APIPort from .env, got %q", cfg.APIPort)
+	}
+	if cfg.RedisPassword != "secret" {
+		t.Errorf("expected RedisPassword from .env, got %q", cfg.RedisPassword)
+	}
+	if cfg.LogLevel != "debug" {
+		t.Errorf("expected explicit env var to override .env, got %q", cfg.LogLevel)
+	}
+}
+
 // clearEnv removes all known config env vars for test isolation.
 // t.Setenv automatically restores them after the test.
 func clearEnv(t *testing.T) {
 	t.Helper()
+	t.Setenv("CONFIG_DISABLE_DOTENV", "1")
 	keys := []string{
 		"SERVICE_NAME", "SERVICE_VERSION", "ENVIRONMENT",
 		"API_PORT", "API_READ_TIMEOUT_S", "API_WRITE_TIMEOUT_S",

@@ -12,11 +12,15 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/urlshortener/platform/internal/application/resolve"
 	"github.com/urlshortener/platform/internal/config"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
 	redisinfra "github.com/urlshortener/platform/internal/infrastructure/redis"
+	"github.com/urlshortener/platform/internal/interfaces/http/handler"
+	httpmiddleware "github.com/urlshortener/platform/internal/interfaces/http/middleware"
+	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
 	"github.com/urlshortener/platform/pkg/telemetry"
 )
@@ -28,26 +32,29 @@ var (
 )
 
 func main() {
+	// ── 1. Configuration ──────────────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
+	// ── 2. Logger ─────────────────────────────────────────────────────────────
 	log := logger.New(cfg.LogLevel, cfg.LogFormat).With(
 		slog.String("service", "redirect-service"),
 		slog.String("version", version),
 		slog.String("commit", commit),
 		slog.String("env", cfg.Environment),
 	)
+	slog.SetDefault(log)
 
-	log.Info("starting service",
+	log.Info("starting redirect-service",
 		slog.String("build_time", buildTime),
 		slog.String("port", cfg.RedirectPort),
 	)
 
+	// ── 3. OpenTelemetry ──────────────────────────────────────────────────────
 	ctx := context.Background()
-
 	otelShutdown, err := telemetry.InitTracer(ctx, telemetry.Config{
 		Enabled:        cfg.OTelEnabled,
 		Exporter:       cfg.OTelExporter,
@@ -62,12 +69,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── PostgreSQL ────────────────────────────────────────────────────────────
+	// ── 4. PostgreSQL ─────────────────────────────────────────────────────────
 	var dbClient *postgres.Client
 	if cfg.DBPrimaryDSN != "" {
-		dbCtx, dbCancel := context.WithTimeout(ctx, 15*time.Second)
+		dbCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		dbClient, err = postgres.New(dbCtx, cfg)
-		dbCancel()
+		cancel()
 		if err != nil {
 			log.Error("failed to connect to postgresql", slog.String("error", err.Error()))
 			os.Exit(1)
@@ -77,81 +84,107 @@ func main() {
 		log.Warn("DB_PRIMARY_DSN not set — running without database")
 	}
 
-	// ── Redis ─────────────────────────────────────────────────────────────────
-	// Redis is critical for the redirect service — it is the primary
-	// resolution path. Without Redis, every redirect hits PostgreSQL.
-	// At peak load this would saturate the DB connection pool immediately.
+	// ── 5. Redis ──────────────────────────────────────────────────────────────
 	var redisClient *redisinfra.Client
 	if cfg.RedisAddr != "" {
-		redisCtx, redisCancel := context.WithTimeout(ctx, 10*time.Second)
+		redisCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		redisClient, err = redisinfra.New(redisCtx, cfg)
-		redisCancel()
+		cancel()
 		if err != nil {
 			log.Error("failed to connect to redis", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 		log.Info("redis connected", slog.String("addr", cfg.RedisAddr))
 	} else {
-		log.Warn("REDIS_ADDR not set — running without cache (DB-only mode)")
+		log.Warn("REDIS_ADDR not set — running without cache")
 	}
 
-	// ── HTTP Router ───────────────────────────────────────────────────────────
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(time.Duration(cfg.RedirectWriteTimeoutS) * time.Second))
+	// ── 6. Infrastructure adapters ────────────────────────────────────────────
+	// The redirect service uses ReadonlyRepository — it never writes to the DB.
+	// This is enforced at the type level: postgres.URLRepository satisfies
+	// both Repository and ReadonlyRepository interfaces.
+	var urlRepo *postgres.URLRepository
+	if dbClient != nil {
+		urlRepo = postgres.NewURLRepository(dbClient)
+	}
 
+	var urlCache *redisinfra.URLCache
+	if redisClient != nil {
+		urlCache = redisinfra.NewURLCache(redisClient)
+	}
+
+	// ── 7. Application use case handler ───────────────────────────────────────
+	// The resolve handler is always created; it handles nil cache gracefully
+	// by falling back to DB-only mode (no Redis = all requests hit PostgreSQL).
+	resolveHandler := resolve.NewHandler(
+		urlRepo,
+		urlCache,
+		cfg.RedirectCacheTTLS,
+		cfg.CacheNegativeTTLS,
+		log,
+	)
+
+	// ── 8. HTTP handler ───────────────────────────────────────────────────────
+	redirectHTTPHandler := handler.NewRedirectHandler(resolveHandler, log)
+
+	// ── 9. Router ─────────────────────────────────────────────────────────────
+	r := chi.NewRouter()
+
+	// Redirect service middleware is intentionally leaner than API service:
+	// - No Timeout middleware (redirect handler has its own short TTL via context)
+	// - Recoverer still needed to prevent goroutine leaks on panic
+	r.Use(chimiddleware.RequestID)
+	r.Use(chimiddleware.RealIP)
+	r.Use(httpmiddleware.OTel("redirect-service"))
+	r.Use(httpmiddleware.RequestLogger(log))
+	r.Use(chimiddleware.Recoverer)
+	// TODO(story-1.6): add Prometheus metrics middleware here
+
+	// Health probes
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"alive"}`))
+		response.JSON(w, http.StatusOK, map[string]string{"status": "alive"})
 	})
 
 	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		pingCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 
-		if dbClient == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"not ready","reason":"database not configured"}`))
-			return
+		if dbClient != nil {
+			if err := dbClient.Ping(pingCtx); err != nil {
+				log.Warn("readiness: postgresql ping failed", slog.String("error", err.Error()))
+				response.WriteProblem(w, response.Problem{
+					Type:   response.ProblemTypeInternal,
+					Title:  "Not Ready",
+					Status: http.StatusServiceUnavailable,
+					Detail: "database unreachable",
+				})
+				return
+			}
 		}
-		if err := dbClient.Ping(pingCtx); err != nil {
-			log.Warn("readiness: postgresql ping failed", slog.String("error", err.Error()))
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"not ready","reason":"database unreachable"}`))
-			return
+		if redisClient != nil {
+			if err := redisClient.Ping(pingCtx); err != nil {
+				log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
+				response.WriteProblem(w, response.Problem{
+					Type:   response.ProblemTypeInternal,
+					Title:  "Not Ready",
+					Status: http.StatusServiceUnavailable,
+					Detail: "cache unreachable",
+				})
+				return
+			}
 		}
-
-		if redisClient == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"not ready","reason":"cache not configured"}`))
-			return
-		}
-		if err := redisClient.Ping(pingCtx); err != nil {
-			log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"not ready","reason":"cache unreachable"}`))
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ready"}`))
+		response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
-	r.Get("/{shortcode}", func(w http.ResponseWriter, r *http.Request) {
-		// Full resolution handler implemented in Story 1.5.
-		shortCode := chi.URLParam(r, "shortcode")
-		log.Info("redirect request received",
-			slog.String("short_code", shortCode),
-			slog.String("request_id", middleware.GetReqID(r.Context())),
-		)
-		http.Error(w, "not implemented", http.StatusNotImplemented)
-	})
+	// ── The redirect route — the most-hit route in the entire platform ─────────
+	// Pattern: /{shortcode}
+	// All single-segment paths are treated as short codes.
+	// Multi-segment paths (/api/v1/..., /healthz) are registered first and
+	// take priority because chi routes are matched in registration order
+	// within the same specificity level.
+	r.Get("/{shortcode}", redirectHTTPHandler.Handle)
 
-	// ── HTTP Server ───────────────────────────────────────────────────────────
+	// ── 10. HTTP Server ───────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         ":" + cfg.RedirectPort,
 		Handler:      r,
@@ -168,22 +201,22 @@ func main() {
 		}
 	}()
 
-	// ── Graceful Shutdown ─────────────────────────────────────────────────────
+	// ── 11. Graceful Shutdown ─────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
 	case err := <-serverErr:
-		log.Error("server error, initiating shutdown", slog.String("error", err.Error()))
+		log.Error("server error", slog.String("error", err.Error()))
 	case sig := <-quit:
 		log.Info("shutdown signal received", slog.String("signal", sig.String()))
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(
+	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),
 		time.Duration(cfg.RedirectShutdownTimeoutS)*time.Second,
 	)
-	defer shutdownCancel()
+	defer cancel()
 
 	log.Info("shutting down redirect server")
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -191,14 +224,11 @@ func main() {
 	}
 
 	if redisClient != nil {
-		log.Info("closing redis connections")
 		if err := redisClient.Close(); err != nil {
 			log.Error("redis close error", slog.String("error", err.Error()))
 		}
 	}
-
 	if dbClient != nil {
-		log.Info("closing postgresql connections")
 		dbClient.Close()
 	}
 

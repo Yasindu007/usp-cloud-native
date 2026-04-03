@@ -3,7 +3,18 @@
 # ============================================================
 
 .DEFAULT_GOAL := help
-SHELL         := /bin/bash
+
+ifeq ($(OS),Windows_NT)
+  ifneq ($(wildcard C:/Progra~1/Git/usr/bin/sh.exe),)
+    SHELL := C:/Progra~1/Git/usr/bin/sh.exe
+  else ifneq ($(wildcard C:/msys64/usr/bin/bash.exe),)
+    SHELL := C:/msys64/usr/bin/bash.exe
+  else
+    SHELL := /bin/bash
+  endif
+else
+  SHELL := /bin/bash
+endif
 
 # Build configuration
 MODULE          := github.com/urlshortener/platform
@@ -14,7 +25,7 @@ REDIRECT_BINARY := $(BUILD_DIR)/redirector
 # Versioning (injected at build time)
 GIT_SHA  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
 GIT_TAG  := $(shell git describe --tags --always 2>/dev/null || echo "v0.0.0-dev")
-BUILD_TS := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+BUILD_TS := $(shell git log -1 --format=%cI 2>/dev/null || echo "unknown")
 
 LDFLAGS := -s -w \
 	-X main.version=$(GIT_TAG) \
