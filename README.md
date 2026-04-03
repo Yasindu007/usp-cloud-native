@@ -56,6 +56,45 @@ make run-api
 make run-redirector
 ```
 
+## Windows (PowerShell)
+
+```powershell
+# 1. Clone repository
+git clone https://github.com/your-org/url-shortener
+cd url-shortener
+
+# 2. Copy environment config
+Copy-Item .env.example .env
+
+# 3. Start infrastructure
+docker compose -f docker-compose.dev.yml up -d
+
+# 4. Run database migrations
+go run ./cmd/migrate up
+
+# 5. Generate RSA key pair for local JWT auth
+bash scripts/gen-jwt-keys.sh
+
+# 6. Start mock issuer (new terminal)
+go run ./cmd/mockissuer
+
+# 7. Start API service (new terminal)
+go run ./cmd/api
+```
+
+Get a token and call the API:
+
+```powershell
+# Mint a token (PowerShell helper)
+.\scripts\get-token.ps1 ws_myworkspace usr_myuser "read write"
+
+# Or capture it into $TOKEN
+$TOKEN=(.\scripts\get-token.ps1 ws_myworkspace usr_myuser "read write" | Select-String -Pattern "^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$").Line
+
+# Create a short URL
+.\scripts\shorten.ps1 -Token $TOKEN -OriginalUrl "https://github.com/golang/go" -Title "Go Repo"
+```
+
 ## Project Structure
 .
 ├── cmd/                    Entry points for each service binary
