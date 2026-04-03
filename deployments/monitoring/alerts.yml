@@ -1,0 +1,148 @@
+# Alerting rules for the URL Shortener Platform.
+#
+# Alert design principles (from Google SRE Workbook multi-window burn rate):
+#   - Fast burn (1h window): catches incidents consuming budget quickly
+#     14.4× burn rate over 1h = consuming the 30-day error budget in 2 days
+#   - Slow burn (6h window): catches subtle degradation
+#     6× burn rate over 6h = consuming the 30-day error budget in 5 days
+#
+# Severity levels:
+#   critical: page on-call immediately (SLO breach imminent)
+#   warning:  create ticket, investigate within business hours
+
+groups:
+  - name: urlshortener.availability
+    rules:
+
+      # ── SLO-01: Redirect Availability (99.95% target) ─────────────────────
+      # Error budget: 21.6 minutes per 30 days
+      # 14.4× burn: consuming budget in 2 days → page immediately
+      - alert: RedirectErrorBudgetBurnCritical
+        expr: |
+          slo:redirect_error_ratio:rate1h > (14.4 * 0.0005)
+          and
+          slo:redirect_error_ratio:rate5m > (14.4 * 0.0005)
+        for: 2m
+        labels:
+          severity: critical
+          slo: redirect-availability
+        annotations:
+          summary: "Redirect service error budget burning at critical rate"
+          description: |
+            Redirect error ratio is {{ $value | humanizePercentage }} over the last hour.
+            At this rate the 30-day error budget will be exhausted in 2 days.
+            SLO target: 99.95% availability (error budget: 21.6 min/30d).
+          runbook: "https://runbooks.example.com/redirect-error-budget-burn"
+
+      # 6× burn: consuming budget in 5 days → ticket
+      - alert: RedirectErrorBudgetBurnWarning
+        expr: |
+          slo:redirect_error_ratio:rate6h > (6 * 0.0005)
+          and
+          slo:redirect_error_ratio:rate1h > (6 * 0.0005)
+        for: 15m
+        labels:
+          severity: warning
+          slo: redirect-availability
+        annotations:
+          summary: "Redirect service error budget burning at elevated rate"
+          description: |
+            Redirect error ratio is {{ $value | humanizePercentage }} over 6 hours.
+            Slow burn detected — investigate before budget is exhausted.
+
+      # ── SLO-02: API Availability (99.9% target) ───────────────────────────
+      # Error budget: 43.2 minutes per 30 days
+      - alert: APIErrorBudgetBurnCritical
+        expr: |
+          slo:api_error_ratio:rate1h > (14.4 * 0.001)
+          and
+          slo:api_error_ratio:rate5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "API service error budget burning at critical rate"
+          description: |
+            API error ratio is {{ $value | humanizePercentage }} over the last hour.
+
+  - name: urlshortener.latency
+    rules:
+
+      # ── SLO-03: Redirect P99 Latency < 50ms ──────────────────────────────
+      - alert: RedirectLatencyP99High
+        expr: slo:redirect_latency_p99:rate5m > 0.050
+        for: 5m
+        labels:
+          severity: warning
+          slo: redirect-latency
+        annotations:
+          summary: "Redirect P99 latency exceeds 50ms SLO"
+          description: |
+            Redirect P99 latency is {{ $value | humanizeDuration }} over the last 5 minutes.
+            SLO target: P99 < 50ms.
+            Check: cache hit ratio, DB pool saturation, Redis latency.
+
+      # ── SLO-04: API Write P99 Latency < 200ms ─────────────────────────────
+      - alert: APIWriteLatencyP99High
+        expr: slo:api_write_latency_p99:rate5m > 0.200
+        for: 5m
+        labels:
+          severity: warning
+          slo: api-latency
+        annotations:
+          summary: "API write P99 latency exceeds 200ms SLO"
+          description: |
+            API write P99 latency is {{ $value | humanizeDuration }} over the last 5 minutes.
+
+  - name: urlshortener.cache
+    rules:
+
+      # ── SLO-05: Cache Hit Ratio > 85% ─────────────────────────────────────
+      - alert: CacheHitRatioLow
+        expr: slo:cache_hit_ratio:rate5m < 0.80
+        for: 10m
+        labels:
+          severity: warning
+          slo: cache-effectiveness
+        annotations:
+          summary: "Redis cache hit ratio below 80%"
+          description: |
+            Cache hit ratio is {{ $value | humanizePercentage }} over the last 5 minutes.
+            SLO target: > 85%.
+            Possible causes: Redis restart flushed keys, TTL too short, new traffic patterns.
+
+  - name: urlshortener.infrastructure
+    rules:
+
+      # ── DB Pool Saturation ────────────────────────────────────────────────
+      - alert: DBPoolSaturationHigh
+        expr: job:db_pool_saturation:primary > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL primary pool saturation above 80%"
+          description: |
+            DB pool saturation: {{ $value | humanizePercentage }}.
+            Queries may be queuing for connections. Consider scaling pods or increasing DB_MAX_OPEN_CONNS.
+
+      # ── Service down ──────────────────────────────────────────────────────
+      - alert: RedirectServiceDown
+        expr: absent(up{job="redirect-service"}) or up{job="redirect-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redirect service is not being scraped by Prometheus"
+          description: |
+            The redirect service metrics endpoint is unreachable.
+            This may indicate the service is down or the metrics port is blocked.
+
+      - alert: APIServiceDown
+        expr: absent(up{job="api-service"}) or up{job="api-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API service is not being scraped by Prometheus"

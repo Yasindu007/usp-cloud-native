@@ -1,12 +1,5 @@
 // Package config loads all application configuration from environment variables.
-// This satisfies the 12-Factor App principle III (Config) — all configuration
-// must come from the environment, never from files committed to source control.
-//
-// Design rationale:
-//   - Zero external dependencies (no Viper, no godotenv in production code)
-//   - Explicit over implicit: every variable is named and has a clear default
-//   - Validation at startup: fail fast rather than failing mid-request
-//   - Grouped by subsystem for readability and future extraction
+// 12-Factor App principle III: store config in the environment.
 package config
 
 import (
@@ -20,31 +13,29 @@ import (
 )
 
 // Config holds all runtime configuration for the platform.
-// Grouping by subsystem makes it easy to pass only the relevant
-// sub-config to each infrastructure adapter.
 type Config struct {
-	// Service identity — used in logs, traces, and metrics labels
 	ServiceName    string
 	ServiceVersion string
-	Environment    string // development | staging | production
+	Environment    string
 
-	// API service HTTP configuration
-	APIPort              string
-	APIReadTimeoutS      int
-	APIWriteTimeoutS     int
-	APIIdleTimeoutS      int
-	APIShutdownTimeoutS  int
+	APIPort             string
+	APIReadTimeoutS     int
+	APIWriteTimeoutS    int
+	APIIdleTimeoutS     int
+	APIShutdownTimeoutS int
 
-	// Redirect service HTTP configuration
 	RedirectPort             string
 	RedirectReadTimeoutS     int
 	RedirectWriteTimeoutS    int
 	RedirectIdleTimeoutS     int
 	RedirectShutdownTimeoutS int
 
-	// PostgreSQL — separate DSNs enforce read/write split at the app layer.
-	// In Phase 1 both point to the same instance; in Phase 4 the replica
-	// DSN points to the read replica StatefulSet pod.
+	// MetricsPort is the port for the dedicated Prometheus /metrics HTTP server.
+	// This server is separate from the application HTTP server so metrics are
+	// never exposed through the public API gateway (WSO2 / Ingress).
+	// Default: 9090 (conventional Prometheus exporter port)
+	MetricsPort string
+
 	DBPrimaryDSN       string
 	DBReplicaDSN       string
 	DBMaxOpenConns     int32
@@ -52,7 +43,6 @@ type Config struct {
 	DBConnMaxLifetimeM int
 	DBConnMaxIdleTimeM int
 
-	// Redis
 	RedisAddr          string
 	RedisPassword      string
 	RedisDB            int
@@ -62,59 +52,50 @@ type Config struct {
 	RedisReadTimeoutS  int
 	RedisWriteTimeoutS int
 
-	// Redis TTLs
-	RedirectCacheTTLS  int // TTL for cached redirect entries
-	CacheNegativeTTLS  int // TTL for "not found" cache entries (negative caching)
+	RedirectCacheTTLS int
+	CacheNegativeTTLS int
 
-	// OpenTelemetry
 	OTelEnabled    bool
-	OTelExporter   string  // stdout | otlp
-	OTelEndpoint   string  // OTLP gRPC endpoint (host:port)
-	OTelSampleRate float64 // 0.0–1.0
+	OTelExporter   string
+	OTelEndpoint   string
+	OTelSampleRate float64
 
-	// Logging
-	LogLevel  string // debug | info | warn | error
-	LogFormat string // json | text
+	LogLevel  string
+	LogFormat string
 
-	// Short code generation
 	ShortCodeLength int
-	BaseURL         string // Public-facing base URL for shortened links
+	BaseURL         string
 
-	// JWT authentication (Phase 1: local mock issuer)
 	JWTIssuer        string
 	JWTAudience      string
 	JWTPublicKeyPath string
 }
 
-// Load reads all configuration from environment variables and validates
-// that required variables are set. Returns an error if validation fails
-// so the caller can exit immediately (fail-fast principle).
+// Load reads all configuration from environment variables and validates them.
 func Load() (*Config, error) {
 	if err := LoadDotEnv(); err != nil {
 		return nil, err
 	}
 
 	cfg := &Config{
-		// Service identity
 		ServiceName:    getEnv("SERVICE_NAME", "url-shortener-api"),
 		ServiceVersion: getEnv("SERVICE_VERSION", "dev"),
 		Environment:    getEnv("ENVIRONMENT", "development"),
 
-		// API service
 		APIPort:             getEnv("API_PORT", "8080"),
 		APIReadTimeoutS:     getEnvInt("API_READ_TIMEOUT_S", 10),
 		APIWriteTimeoutS:    getEnvInt("API_WRITE_TIMEOUT_S", 30),
 		APIIdleTimeoutS:     getEnvInt("API_IDLE_TIMEOUT_S", 60),
 		APIShutdownTimeoutS: getEnvInt("API_SHUTDOWN_TIMEOUT_S", 30),
 
-		// Redirect service
 		RedirectPort:             getEnv("REDIRECT_PORT", "8081"),
 		RedirectReadTimeoutS:     getEnvInt("REDIRECT_READ_TIMEOUT_S", 5),
 		RedirectWriteTimeoutS:    getEnvInt("REDIRECT_WRITE_TIMEOUT_S", 10),
 		RedirectIdleTimeoutS:     getEnvInt("REDIRECT_IDLE_TIMEOUT_S", 60),
 		RedirectShutdownTimeoutS: getEnvInt("REDIRECT_SHUTDOWN_TIMEOUT_S", 30),
 
-		// PostgreSQL
+		MetricsPort: getEnv("METRICS_PORT", "9090"),
+
 		DBPrimaryDSN:       getEnv("DB_PRIMARY_DSN", ""),
 		DBReplicaDSN:       getEnv("DB_REPLICA_DSN", ""),
 		DBMaxOpenConns:     int32(getEnvInt("DB_MAX_OPEN_CONNS", 25)),
@@ -122,7 +103,6 @@ func Load() (*Config, error) {
 		DBConnMaxLifetimeM: getEnvInt("DB_CONN_MAX_LIFETIME_M", 15),
 		DBConnMaxIdleTimeM: getEnvInt("DB_CONN_MAX_IDLE_TIME_M", 5),
 
-		// Redis
 		RedisAddr:          getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:      getEnv("REDIS_PASSWORD", ""),
 		RedisDB:            getEnvInt("REDIS_DB", 0),
@@ -132,25 +112,20 @@ func Load() (*Config, error) {
 		RedisReadTimeoutS:  getEnvInt("REDIS_READ_TIMEOUT_S", 3),
 		RedisWriteTimeoutS: getEnvInt("REDIS_WRITE_TIMEOUT_S", 3),
 
-		// Redis TTLs
 		RedirectCacheTTLS: getEnvInt("REDIRECT_CACHE_TTL_S", 3600),
 		CacheNegativeTTLS: getEnvInt("CACHE_NEGATIVE_TTL_S", 60),
 
-		// OpenTelemetry
 		OTelEnabled:    getEnvBool("OTEL_ENABLED", true),
 		OTelExporter:   getEnv("OTEL_EXPORTER", "stdout"),
 		OTelEndpoint:   getEnv("OTEL_ENDPOINT", "localhost:4317"),
 		OTelSampleRate: getEnvFloat("OTEL_SAMPLE_RATE", 1.0),
 
-		// Logging
 		LogLevel:  getEnv("LOG_LEVEL", "info"),
 		LogFormat: getEnv("LOG_FORMAT", "json"),
 
-		// Short codes
 		ShortCodeLength: getEnvInt("SHORT_CODE_LENGTH", 7),
 		BaseURL:         getEnv("BASE_URL", "http://localhost:8081"),
 
-		// JWT
 		JWTIssuer:        getEnv("JWT_ISSUER", ""),
 		JWTAudience:      getEnv("JWT_AUDIENCE", ""),
 		JWTPublicKeyPath: getEnv("JWT_PUBLIC_KEY_PATH", ""),
@@ -226,13 +201,9 @@ func LoadDotEnv() error {
 	return nil
 }
 
-// validate performs semantic validation on the loaded configuration.
-// This catches misconfiguration at startup rather than at request time.
 func (c *Config) validate() error {
 	var errs []string
 
-	// In production, DSNs are required. In development we allow empty
-	// (services start without DB for structural testing).
 	if c.Environment == "production" {
 		if c.DBPrimaryDSN == "" {
 			errs = append(errs, "DB_PRIMARY_DSN is required in production")
@@ -251,7 +222,6 @@ func (c *Config) validate() error {
 	if c.ShortCodeLength < 4 || c.ShortCodeLength > 32 {
 		errs = append(errs, "SHORT_CODE_LENGTH must be between 4 and 32")
 	}
-
 	if c.OTelSampleRate < 0.0 || c.OTelSampleRate > 1.0 {
 		errs = append(errs, "OTEL_SAMPLE_RATE must be between 0.0 and 1.0")
 	}
@@ -269,25 +239,11 @@ func (c *Config) validate() error {
 	if len(errs) > 0 {
 		return errors.New("configuration errors:\n  - " + strings.Join(errs, "\n  - "))
 	}
-
 	return nil
 }
 
-// IsProduction returns true when running in the production environment.
-// Used by components that need environment-specific behavior (e.g., log level,
-// OTel sample rate, TLS enforcement).
-func (c *Config) IsProduction() bool {
-	return c.Environment == "production"
-}
-
-// IsDevelopment returns true when running in the development environment.
-func (c *Config) IsDevelopment() bool {
-	return c.Environment == "development"
-}
-
-// ---- Environment variable helpers ----
-// These are package-private helpers. Using them internally keeps the Load()
-// function readable without adding an external dependency like godotenv.
+func (c *Config) IsProduction() bool  { return c.Environment == "production" }
+func (c *Config) IsDevelopment() bool { return c.Environment == "development" }
 
 func getEnv(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {

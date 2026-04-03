@@ -1,0 +1,99 @@
+# Monitoring stack for the URL Shortener Platform.
+# Run separately from docker-compose.dev.yml to keep concerns isolated.
+#
+# Usage:
+#   Start:  docker compose -f docker-compose.monitoring.yml up -d
+#   Stop:   docker compose -f docker-compose.monitoring.yml down
+#   Logs:   docker compose -f docker-compose.monitoring.yml logs -f
+#
+# Access:
+#   Prometheus: http://localhost:9095   (port 9095 avoids conflict with app metrics port 9090)
+#   Grafana:    http://localhost:3000   (admin / admin)
+
+version: '3.9'
+
+services:
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: urlshortener-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Retention: 15 days of metrics data.
+      # Adjust based on available disk space (15d × ~2MB/s scrape ≈ 2.5GB).
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"       # Enable /-/reload for hot config reload
+      - "--web.enable-admin-api"       # Enable admin API for snapshot/delete
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    ports:
+      # Expose Prometheus UI on 9095 to avoid conflicting with the
+      # Go services' metrics ports (9090, 9091).
+      - "9095:9090"
+    volumes:
+      - ./deployments/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deployments/monitoring/recording_rules.yml:/etc/prometheus/recording_rules.yml:ro
+      - ./deployments/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring
+    extra_hosts:
+      # Allows Prometheus to reach services running on the Docker host.
+      # Linux: if host.docker.internal doesn't resolve, use add-host manually:
+      #   docker run --add-host=host.docker.internal:host-gateway ...
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider",
+             "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: urlshortener-grafana
+    restart: unless-stopped
+    environment:
+      # Default credentials — change for any non-local deployment.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Disable telemetry for local development.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Plugins — none needed for Phase 1.
+      GF_INSTALL_PLUGINS: ""
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Provisioning: datasources and dashboard providers are loaded on startup.
+      - ./deployments/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Dashboard JSON files — Grafana reads these at startup and on the
+      # updateIntervalSeconds cadence set in dashboard.yml.
+      - ./deployments/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  monitoring:
+    driver: bridge
+    name: urlshortener-monitoring

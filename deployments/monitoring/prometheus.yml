@@ -1,0 +1,82 @@
+# Prometheus scrape configuration for the URL Shortener Platform.
+#
+# Scrape architecture:
+#   Prometheus (Docker) → scrapes Go services on host machine
+#   On Linux: use 172.17.0.1 (Docker bridge gateway IP)
+#   On macOS/Windows: use host.docker.internal
+#
+# Each Go service runs a dedicated metrics server on port 9090
+# (separate from the application HTTP port 8080/8081).
+# This ensures metrics are never routed through WSO2 or the public ingress.
+
+global:
+  # How often to scrape each target.
+  # 15s is the Prometheus default and a good balance between
+  # resolution (shorter windows for rate()) and storage overhead.
+  scrape_interval: 15s
+
+  # How long to wait for a scrape response before marking it as failed.
+  scrape_timeout: 10s
+
+  # How often to evaluate alerting and recording rules.
+  evaluation_interval: 15s
+
+  # Labels added to all metrics from this Prometheus instance.
+  # Useful when federating multiple Prometheus instances.
+  external_labels:
+    environment: "local"
+    cluster: "kind-local"
+
+# Load alerting and recording rules.
+rule_files:
+  - "recording_rules.yml"
+  - "alerts.yml"
+
+# Alertmanager configuration (Phase 4: configure real Alertmanager).
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # ── URL Shortener API Service ──────────────────────────────────────────────
+  - job_name: "api-service"
+    static_configs:
+      - targets:
+          # macOS/Windows Docker Desktop: use host.docker.internal
+          # Linux: use 172.17.0.1 or host IP
+          - "host.docker.internal:9090"
+        labels:
+          service: "api-service"
+    # Relabel to add instance label from address.
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # ── URL Shortener Redirect Service ────────────────────────────────────────
+  - job_name: "redirect-service"
+    static_configs:
+      - targets:
+          - "host.docker.internal:9091"
+        labels:
+          service: "redirect-service"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────
+  # Prometheus scrapes itself so we can alert on scrape failures,
+  # rule evaluation errors, and Prometheus's own resource usage.
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # ── PostgreSQL exporter (Phase 4: add postgres_exporter) ─────────────────
+  # - job_name: "postgres"
+  #   static_configs:
+  #     - targets: ["postgres-exporter:9187"]
+
+  # ── Redis exporter (Phase 4: add redis_exporter) ─────────────────────────
+  # - job_name: "redis"
+  #   static_configs:
+  #     - targets: ["redis-exporter:9121"]

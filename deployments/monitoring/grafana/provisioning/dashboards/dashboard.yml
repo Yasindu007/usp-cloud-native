@@ -1,0 +1,18 @@
+# Grafana dashboard provisioning.
+# Grafana loads dashboards from the configured path on startup.
+# Dashboards are read-only when loaded from files (cannot be edited in UI
+# unless you set disableDeletion: false and allowUiUpdates: true).
+
+apiVersion: 1
+
+providers:
+  - name: "URL Shortener Platform"
+    orgId: 1
+    folder: "URL Shortener"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30   # Check for dashboard file changes every 30s
+    allowUiUpdates: true        # Allow local edits (useful for development)
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

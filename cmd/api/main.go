@@ -16,6 +16,7 @@ import (
 
 	"github.com/urlshortener/platform/internal/application/shorten"
 	"github.com/urlshortener/platform/internal/config"
+	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
 	redisinfra "github.com/urlshortener/platform/internal/infrastructure/redis"
 	"github.com/urlshortener/platform/internal/interfaces/http/handler"
@@ -33,29 +34,29 @@ var (
 )
 
 func main() {
-	// ── 1. Configuration ──────────────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// ── 2. Logger ─────────────────────────────────────────────────────────────
 	log := logger.New(cfg.LogLevel, cfg.LogFormat).With(
 		slog.String("service", cfg.ServiceName),
 		slog.String("version", version),
 		slog.String("commit", commit),
 		slog.String("env", cfg.Environment),
 	)
-	slog.SetDefault(log) // Set as default so library code uses our logger
+	slog.SetDefault(log)
 
 	log.Info("starting api-service",
 		slog.String("build_time", buildTime),
 		slog.String("port", cfg.APIPort),
+		slog.String("metrics_port", cfg.MetricsPort),
 	)
 
-	// ── 3. OpenTelemetry ──────────────────────────────────────────────────────
 	ctx := context.Background()
+
+	// ── OpenTelemetry ─────────────────────────────────────────────────────────
 	otelShutdown, err := telemetry.InitTracer(ctx, telemetry.Config{
 		Enabled:        cfg.OTelEnabled,
 		Exporter:       cfg.OTelExporter,
@@ -70,7 +71,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── 4. PostgreSQL ─────────────────────────────────────────────────────────
+	// ── Prometheus metrics ────────────────────────────────────────────────────
+	// Initialized before infrastructure so build_info is always present
+	// even if DB/Redis connections fail.
+	appMetrics := metrics.New(cfg.ServiceName, version, commit)
+
+	// ── PostgreSQL ────────────────────────────────────────────────────────────
 	var dbClient *postgres.Client
 	if cfg.DBPrimaryDSN != "" {
 		dbCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -85,7 +91,7 @@ func main() {
 		log.Warn("DB_PRIMARY_DSN not set — running without database")
 	}
 
-	// ── 5. Redis ──────────────────────────────────────────────────────────────
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	var redisClient *redisinfra.Client
 	if cfg.RedisAddr != "" {
 		redisCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -100,9 +106,7 @@ func main() {
 		log.Warn("REDIS_ADDR not set — running without cache")
 	}
 
-	// ── 6. Infrastructure adapters ────────────────────────────────────────────
-	// Only wire adapters when infrastructure is available.
-	// Nil adapters are handled gracefully by the use case handlers.
+	// ── Infrastructure adapters ───────────────────────────────────────────────
 	var urlRepo *postgres.URLRepository
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
@@ -113,115 +117,62 @@ func main() {
 		urlCache = redisinfra.NewURLCache(redisClient)
 	}
 
-	// ── 7. Application use case handlers ─────────────────────────────────────
-	// Short code generator — shared by the shorten handler.
+	// ── Application layer ─────────────────────────────────────────────────────
 	codeGenerator := shortcode.New(cfg.ShortCodeLength)
-
-	// ShortenURL use case handler.
-	// Wire: HTTP handler → use case handler → domain ports → infrastructure adapters.
-	var shortenHandler *shorten.Handler
+	var shortenUseCase *shorten.Handler
 	if urlRepo != nil {
-		shortenHandler = shorten.NewHandler(
-			urlRepo,
-			urlCache, // may be nil (shorten still works, no cache pre-warm)
-			codeGenerator,
-			cfg.BaseURL,
-			cfg.RedirectCacheTTLS,
-			log,
+		shortenUseCase = shorten.NewHandler(
+			urlRepo, urlCache, codeGenerator,
+			cfg.BaseURL, cfg.RedirectCacheTTLS, log,
 		)
 	}
 
-	// ── 8. HTTP router and handlers ───────────────────────────────────────────
+	// ── HTTP router ───────────────────────────────────────────────────────────
 	r := chi.NewRouter()
-
-	// ── Global middleware chain ────────────────────────────────────────────────
-	// Order is deliberate:
-	//   RequestID:     must be first so all subsequent middleware can read the ID
-	//   RealIP:        must be early so IP is resolved before logging
-	//   OTel:          must be before logger so trace_id is available for log enrichment
-	//   RequestLogger: uses request_id (set above) and enriches context with logger
-	//   Recoverer:     must be after logger so panics are logged with context
-	//   Timeout:       enforces write deadline — must wrap the actual handler
 
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(httpmiddleware.OTel(cfg.ServiceName))
 	r.Use(httpmiddleware.RequestLogger(log))
+	// Metrics middleware MUST be before Recoverer so panic-induced 500s
+	// are counted. See metrics.go for the detailed explanation.
+	r.Use(httpmiddleware.Metrics(appMetrics, cfg.ServiceName))
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(time.Duration(cfg.APIWriteTimeoutS) * time.Second))
 
-	// ── Health probes ─────────────────────────────────────────────────────────
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "alive"})
 	})
 
-	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		pingCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
+	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
-		if dbClient == nil {
-			response.WriteProblem(w, response.Problem{
-				Type:   response.ProblemTypeInternal,
-				Title:  "Not Ready",
-				Status: http.StatusServiceUnavailable,
-				Detail: "database not configured",
-			})
-			return
-		}
-		if err := dbClient.Ping(pingCtx); err != nil {
-			log.Warn("readiness: postgresql ping failed", slog.String("error", err.Error()))
-			response.WriteProblem(w, response.Problem{
-				Type:   response.ProblemTypeInternal,
-				Title:  "Not Ready",
-				Status: http.StatusServiceUnavailable,
-				Detail: "database unreachable",
-			})
-			return
-		}
-		if redisClient == nil {
-			response.WriteProblem(w, response.Problem{
-				Type:   response.ProblemTypeInternal,
-				Title:  "Not Ready",
-				Status: http.StatusServiceUnavailable,
-				Detail: "cache not configured",
-			})
-			return
-		}
-		if err := redisClient.Ping(pingCtx); err != nil {
-			log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
-			response.WriteProblem(w, response.Problem{
-				Type:   response.ProblemTypeInternal,
-				Title:  "Not Ready",
-				Status: http.StatusServiceUnavailable,
-				Detail: "cache unreachable",
-			})
-			return
-		}
-		response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
-	})
-
-	// ── API routes ────────────────────────────────────────────────────────────
 	r.Route("/api/v1", func(r chi.Router) {
-		// URL resource
-		if shortenHandler != nil {
-			r.Post("/urls", handler.NewShortenHandler(shortenHandler, log).Handle)
+		if shortenUseCase != nil {
+			r.Post("/urls",
+				handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 		} else {
-			// Respond with 503 if dependencies are missing — better than 404.
 			r.Post("/urls", func(w http.ResponseWriter, r *http.Request) {
 				response.WriteProblem(w, response.Problem{
-					Type:   response.ProblemTypeInternal,
-					Title:  "Service Unavailable",
-					Status: http.StatusServiceUnavailable,
-					Detail: "Database not available. Run: make infra-up",
+					Type: response.ProblemTypeInternal, Title: "Service Unavailable",
+					Status: http.StatusServiceUnavailable, Detail: "Database not available.",
 				})
 			})
 		}
-
-		// TODO(story-2.x): GET /urls (list), GET /urls/{id}, PATCH /urls/{id}, DELETE /urls/{id}
-		// TODO(story-2.x): POST /workspaces, GET /workspaces/{id}/members
 	})
 
-	// ── HTTP Server ───────────────────────────────────────────────────────────
+	// ── Separate metrics HTTP server on MetricsPort ───────────────────────────
+	// Running on a dedicated port means:
+	//   - /metrics is never exposed through WSO2 or the public Ingress
+	//   - Prometheus scrapes it directly from the pod's pod IP
+	//   - The application HTTP server is not burdened with metrics scrape traffic
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", appMetrics.Handler())
+	metricsSrv := &http.Server{
+		Addr:    ":" + cfg.MetricsPort,
+		Handler: metricsMux,
+	}
+
+	// ── Application HTTP server ───────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         ":" + cfg.APIPort,
 		Handler:      r,
@@ -238,7 +189,21 @@ func main() {
 		}
 	}()
 
-	// ── Graceful Shutdown ─────────────────────────────────────────────────────
+	go func() {
+		log.Info("metrics server listening", slog.String("addr", metricsSrv.Addr))
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server error", slog.String("error", err.Error()))
+		}
+	}()
+
+	// ── Background: pool stats collector ─────────────────────────────────────
+	// Updates DB and Redis pool gauges every 15s so Prometheus scrapes
+	// current values without us having to instrument every query.
+	// Uses a context that gets cancelled on shutdown to stop the goroutine cleanly.
+	statsCtx, statsCancel := context.WithCancel(ctx)
+	go collectPoolStats(statsCtx, appMetrics, dbClient, redisClient)
+
+	// ── Graceful shutdown ─────────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -249,32 +214,110 @@ func main() {
 		log.Info("shutdown signal received", slog.String("signal", sig.String()))
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(
+	// Stop the pool stats goroutine before closing connections.
+	statsCancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(
 		context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second,
 	)
-	defer cancel()
+	defer shutdownCancel()
 
 	log.Info("shutting down http server")
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown error", slog.String("error", err.Error()))
 	}
 
+	log.Info("shutting down metrics server")
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		log.Error("metrics shutdown error", slog.String("error", err.Error()))
+	}
+
 	if redisClient != nil {
-		log.Info("closing redis connections")
 		if err := redisClient.Close(); err != nil {
 			log.Error("redis close error", slog.String("error", err.Error()))
 		}
 	}
 	if dbClient != nil {
-		log.Info("closing postgresql connections")
 		dbClient.Close()
 	}
 
-	log.Info("flushing telemetry spans")
 	if err := otelShutdown(shutdownCtx); err != nil {
 		log.Error("otel shutdown error", slog.String("error", err.Error()))
 	}
 
 	log.Info("shutdown complete")
+}
+
+// readyHandler returns the Kubernetes readiness probe handler.
+func readyHandler(
+	log *slog.Logger,
+	db *postgres.Client,
+	cache *redisinfra.Client,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pingCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		if db == nil {
+			response.WriteProblem(w, response.Problem{
+				Type: response.ProblemTypeInternal, Title: "Not Ready",
+				Status: http.StatusServiceUnavailable, Detail: "database not configured",
+			})
+			return
+		}
+		if err := db.Ping(pingCtx); err != nil {
+			log.Warn("readiness: postgresql ping failed", slog.String("error", err.Error()))
+			response.WriteProblem(w, response.Problem{
+				Type: response.ProblemTypeInternal, Title: "Not Ready",
+				Status: http.StatusServiceUnavailable, Detail: "database unreachable",
+			})
+			return
+		}
+		if cache == nil {
+			response.WriteProblem(w, response.Problem{
+				Type: response.ProblemTypeInternal, Title: "Not Ready",
+				Status: http.StatusServiceUnavailable, Detail: "cache not configured",
+			})
+			return
+		}
+		if err := cache.Ping(pingCtx); err != nil {
+			log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
+			response.WriteProblem(w, response.Problem{
+				Type: response.ProblemTypeInternal, Title: "Not Ready",
+				Status: http.StatusServiceUnavailable, Detail: "cache unreachable",
+			})
+			return
+		}
+		response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	}
+}
+
+// collectPoolStats runs until ctx is cancelled, updating pool stat gauges
+// on a 15-second tick. This is the correct frequency — more frequent updates
+// would add overhead; less frequent would make the Prometheus scrape see stale values.
+func collectPoolStats(
+	ctx context.Context,
+	m *metrics.Metrics,
+	db *postgres.Client,
+	cache *redisinfra.Client,
+) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if db != nil {
+				s := db.PrimaryStats()
+				m.UpdateDBPoolStats("primary", s.TotalConns, s.IdleConns, s.AcquiredConns, s.MaxConns)
+			}
+			if cache != nil {
+				s := cache.Stats()
+				m.UpdateCachePoolStats(s.TotalConns, s.IdleConns, s.StaleConns)
+			}
+		}
+	}
 }

@@ -1,0 +1,142 @@
+# Recording rules pre-compute expensive PromQL queries on every
+# evaluation interval (15s). This makes Grafana dashboard queries
+# instant even over long time windows.
+#
+# Naming convention for recording rules:
+#   level:metric:operations
+#   - level:    slo, job, instance
+#   - metric:   what is being measured
+#   - operations: aggregations applied
+#
+# Reference: https://prometheus.io/docs/practices/rules/
+
+groups:
+  - name: urlshortener.slo.recording
+    interval: 15s
+    rules:
+
+      # ── SLI-01: Redirect Service Availability ─────────────────────────────
+      # 5-minute error ratio for the redirect service.
+      # Used in SLO dashboard and error budget burn rate alert.
+      - record: slo:redirect_error_ratio:rate5m
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service",
+            status_code=~"5.."
+          }[5m]))
+          /
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service"
+          }[5m]))
+
+      # 1-hour error ratio — used for burn rate alert (fast burn detection).
+      - record: slo:redirect_error_ratio:rate1h
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service",
+            status_code=~"5.."
+          }[1h]))
+          /
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service"
+          }[1h]))
+
+      # 6-hour error ratio — used for burn rate alert (slow burn detection).
+      - record: slo:redirect_error_ratio:rate6h
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service",
+            status_code=~"5.."
+          }[6h]))
+          /
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service"
+          }[6h]))
+
+      # ── SLI-02: API Service Availability ──────────────────────────────────
+      - record: slo:api_error_ratio:rate5m
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="api-service",
+            status_code=~"5.."
+          }[5m]))
+          /
+          sum(rate(urlshortener_http_requests_total{
+            service="api-service"
+          }[5m]))
+
+      - record: slo:api_error_ratio:rate1h
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="api-service",
+            status_code=~"5.."
+          }[1h]))
+          /
+          sum(rate(urlshortener_http_requests_total{
+            service="api-service"
+          }[1h]))
+
+      # ── SLI-03: Redirect P99 Latency ──────────────────────────────────────
+      # Pre-computed P99 over a 5-minute window.
+      # histogram_quantile is expensive — pre-computing it here saves Grafana
+      # from recomputing it on every dashboard refresh.
+      - record: slo:redirect_latency_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(urlshortener_http_request_duration_seconds_bucket{
+              service="redirect-service"
+            }[5m])) by (le)
+          )
+
+      - record: slo:redirect_latency_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(urlshortener_http_request_duration_seconds_bucket{
+              service="redirect-service"
+            }[5m])) by (le)
+          )
+
+      - record: slo:redirect_latency_p50:rate5m
+        expr: |
+          histogram_quantile(0.50,
+            sum(rate(urlshortener_http_request_duration_seconds_bucket{
+              service="redirect-service"
+            }[5m])) by (le)
+          )
+
+      # ── SLI-04: API Write P99 Latency ─────────────────────────────────────
+      - record: slo:api_write_latency_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(urlshortener_http_request_duration_seconds_bucket{
+              service="api-service",
+              method="POST"
+            }[5m])) by (le)
+          )
+
+      # ── SLI-05: Cache Hit Ratio ────────────────────────────────────────────
+      - record: slo:cache_hit_ratio:rate5m
+        expr: |
+          sum(rate(urlshortener_redirects_total{cache_status="hit"}[5m]))
+          /
+          sum(rate(urlshortener_redirects_total[5m]))
+
+      # ── Throughput recording ───────────────────────────────────────────────
+      - record: job:redirect_rps:rate1m
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="redirect-service"
+          }[1m]))
+
+      - record: job:api_rps:rate1m
+        expr: |
+          sum(rate(urlshortener_http_requests_total{
+            service="api-service"
+          }[1m]))
+
+      # ── DB pool saturation ─────────────────────────────────────────────────
+      - record: job:db_pool_saturation:primary
+        expr: |
+          urlshortener_db_pool_connections{pool="primary", state="acquired"}
+          /
+          urlshortener_db_pool_connections{pool="primary", state="max"}

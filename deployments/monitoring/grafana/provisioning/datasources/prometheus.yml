@@ -1,0 +1,27 @@
+# Grafana datasource provisioning.
+# Grafana loads this file on startup and creates the Prometheus datasource
+# automatically. No manual configuration in the UI is needed.
+#
+# The UID "prometheus" is referenced in the dashboard JSON panels.
+# If you change it here, update urlshortener.json panel datasource UIDs too.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    # Prometheus runs in the same Docker network as Grafana.
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # timeInterval must match prometheus.yml scrape_interval.
+      # Grafana uses this to calculate the minimum step for queries.
+      timeInterval: "15s"
+      # Enable exemplars for trace → metrics correlation (Phase 4).
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+    editable: false
