@@ -12,12 +12,13 @@ import (
 
 	"github.com/urlshortener/platform/internal/application/apperrors"
 	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
+	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
 )
 
-// ── Workspace use case interfaces ─────────────────────────────────────────────
+// ── Use case interfaces ────────────────────────────────────────────────────────
 
 type WorkspaceCreator interface {
 	Handle(ctx context.Context, cmd appworkspace.CreateCommand) (*appworkspace.CreateResult, error)
@@ -51,7 +52,7 @@ type AddMemberRequest struct {
 	Role   string `json:"role"`
 }
 
-// ── WorkspaceHandler handles all workspace HTTP endpoints ─────────────────────
+// ── WorkspaceHandler ──────────────────────────────────────────────────────────
 
 type WorkspaceHandler struct {
 	creator      WorkspaceCreator
@@ -62,28 +63,17 @@ type WorkspaceHandler struct {
 	log          *slog.Logger
 }
 
-// NewWorkspaceHandler creates a WorkspaceHandler.
 func NewWorkspaceHandler(
-	creator WorkspaceCreator,
-	getter WorkspaceGetter,
-	lister WorkspaceLister,
-	memberAdder MemberAdder,
-	memberLister MemberLister,
-	log *slog.Logger,
+	creator WorkspaceCreator, getter WorkspaceGetter, lister WorkspaceLister,
+	memberAdder MemberAdder, memberLister MemberLister, log *slog.Logger,
 ) *WorkspaceHandler {
 	return &WorkspaceHandler{
-		creator:      creator,
-		getter:       getter,
-		lister:       lister,
-		memberAdder:  memberAdder,
-		memberLister: memberLister,
-		log:          log,
+		creator: creator, getter: getter, lister: lister,
+		memberAdder: memberAdder, memberLister: memberLister, log: log,
 	}
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
-
-// Create handles POST /api/v1/workspaces
+// Create handles POST /api/v1/workspaces.
 func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 	log := logger.FromContext(r.Context()).With(
 		slog.String("handler", "WorkspaceHandler.Create"),
@@ -93,8 +83,7 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
 		response.WriteProblem(w, response.Problem{
-			Type:   response.ProblemTypeUnauthenticated,
-			Title:  "Unauthorized",
+			Type: response.ProblemTypeUnauthenticated, Title: "Unauthorized",
 			Status: http.StatusUnauthorized,
 		})
 		return
@@ -117,15 +106,18 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Info("workspace created",
-		slog.String("workspace_id", result.ID),
-		slog.String("slug", result.Slug),
+	// Audit annotation
+	domainaudit.AnnotateContext(r.Context(),
+		domainaudit.ResourceWorkspace,
+		result.ID,
+		map[string]any{"name": result.Name, "slug": result.Slug},
 	)
 
+	log.Info("workspace created", slog.String("id", result.ID), slog.String("slug", result.Slug))
 	response.JSON(w, http.StatusCreated, response.Envelope{Data: result})
 }
 
-// Get handles GET /api/v1/workspaces/{workspaceID}
+// Get handles GET /api/v1/workspaces/{workspaceID}.
 func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
@@ -135,22 +127,18 @@ func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
 	workspaceID := chi.URLParam(r, "workspaceID")
-
 	result, err := h.getter.Handle(r.Context(), appworkspace.GetQuery{
-		WorkspaceID:      workspaceID,
-		RequestingUserID: claims.UserID,
+		WorkspaceID: workspaceID, RequestingUserID: claims.UserID,
 	})
 	if err != nil {
 		h.writeError(w, r, err, logger.FromContext(r.Context()))
 		return
 	}
-
 	response.JSON(w, http.StatusOK, response.Envelope{Data: result})
 }
 
-// List handles GET /api/v1/workspaces
+// List handles GET /api/v1/workspaces.
 func (h *WorkspaceHandler) List(w http.ResponseWriter, r *http.Request) {
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
@@ -160,23 +148,17 @@ func (h *WorkspaceHandler) List(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	results, err := h.lister.Handle(r.Context(), appworkspace.ListQuery{
-		UserID: claims.UserID,
-	})
+	results, err := h.lister.Handle(r.Context(), appworkspace.ListQuery{UserID: claims.UserID})
 	if err != nil {
 		h.writeError(w, r, err, logger.FromContext(r.Context()))
 		return
 	}
-
 	response.JSON(w, http.StatusOK, response.Envelope{Data: results})
 }
 
-// AddMember handles POST /api/v1/workspaces/{workspaceID}/members
+// AddMember handles POST /api/v1/workspaces/{workspaceID}/members.
 func (h *WorkspaceHandler) AddMember(w http.ResponseWriter, r *http.Request) {
-	log := logger.FromContext(r.Context()).With(
-		slog.String("handler", "WorkspaceHandler.AddMember"),
-	)
+	log := logger.FromContext(r.Context()).With(slog.String("handler", "WorkspaceHandler.AddMember"))
 
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
@@ -207,10 +189,20 @@ func (h *WorkspaceHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audit annotation: member add affects the member resource
+	domainaudit.AnnotateContext(r.Context(),
+		domainaudit.ResourceMember,
+		req.UserID, // the invited user is the resource
+		map[string]any{
+			"role":       result.Role,
+			"invited_by": claims.UserID,
+		},
+	)
+
 	response.JSON(w, http.StatusCreated, response.Envelope{Data: result})
 }
 
-// ListMembers handles GET /api/v1/workspaces/{workspaceID}/members
+// ListMembers handles GET /api/v1/workspaces/{workspaceID}/members.
 func (h *WorkspaceHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
@@ -220,22 +212,16 @@ func (h *WorkspaceHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
 	workspaceID := chi.URLParam(r, "workspaceID")
-
 	results, err := h.memberLister.Handle(r.Context(), appworkspace.ListMembersQuery{
-		WorkspaceID:      workspaceID,
-		RequestingUserID: claims.UserID,
+		WorkspaceID: workspaceID, RequestingUserID: claims.UserID,
 	})
 	if err != nil {
 		h.writeError(w, r, err, logger.FromContext(r.Context()))
 		return
 	}
-
 	response.JSON(w, http.StatusOK, response.Envelope{Data: results})
 }
-
-// ── Error mapping ─────────────────────────────────────────────────────────────
 
 func (h *WorkspaceHandler) writeError(w http.ResponseWriter, r *http.Request, err error, log *slog.Logger) {
 	var ve *apperrors.ValidationError
@@ -256,7 +242,6 @@ func (h *WorkspaceHandler) writeError(w http.ResponseWriter, r *http.Request, er
 		response.Conflict(w, "A workspace with that name or slug already exists.", r.URL.Path)
 		return
 	}
-
 	log.Error("unexpected error in workspace handler",
 		slog.String("error", err.Error()),
 		slog.String("path", r.URL.Path),

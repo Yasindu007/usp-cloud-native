@@ -12,6 +12,7 @@ import (
 
 	"github.com/urlshortener/platform/internal/application/apperrors"
 	"github.com/urlshortener/platform/internal/application/shorten"
+	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
@@ -49,7 +50,6 @@ type ShortenHandler struct {
 }
 
 // NewShortenHandler constructs a ShortenHandler.
-// metrics is variadic for backward compatibility with tests.
 func NewShortenHandler(shortener URLShortener, log *slog.Logger, m ...*metrics.Metrics) *ShortenHandler {
 	var met *metrics.Metrics
 	if len(m) > 0 {
@@ -59,20 +59,7 @@ func NewShortenHandler(shortener URLShortener, log *slog.Logger, m ...*metrics.M
 }
 
 // Handle processes POST /api/v1/urls.
-//
-// Identity extraction (Phase 2 — from JWT claims):
-//
-//	The JWT middleware (applied at the router level) validates the token and
-//	stores Claims in the request context. This handler reads workspace_id and
-//	user_id from the claims — not from headers. This is the secure path.
-//
-// Development fallback:
-//
-//	If no claims are in context (middleware not applied, e.g. unit tests),
-//	the handler falls back to X-Workspace-ID and X-User-ID headers.
-//	This fallback is ONLY active when auth middleware is not wired in.
-//	In production, the middleware always runs first — if it passes, claims
-//	are always present. If it fails, the handler never runs (401 returned).
+// Annotates the audit context with the created URL's ID and short code.
 func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	log := logger.FromContext(r.Context()).With(
 		slog.String("handler", "ShortenHandler"),
@@ -84,7 +71,6 @@ func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	var req ShortenRequest
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-
 	if err := dec.Decode(&req); err != nil {
 		var syntaxErr *json.SyntaxError
 		var unmarshalErr *json.UnmarshalTypeError
@@ -101,13 +87,6 @@ func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── Identity resolution ───────────────────────────────────────────────────
-	// Priority 1: JWT claims (Phase 2, production path)
-	// Priority 2: Request headers (Phase 1 stub, development/test fallback)
-	//
-	// When the auth middleware is applied at the router level, claims are
-	// always present by the time this handler runs. The header fallback
-	// exists so unit tests work without needing to set up JWT infrastructure.
 	workspaceID, userID := resolveIdentity(r)
 
 	cmd := shorten.Command{
@@ -124,6 +103,19 @@ func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err, log)
 		return
 	}
+
+	// ── Audit annotation ──────────────────────────────────────────────────────
+	// Annotate the pending audit event (started by AuditAction middleware)
+	// with the created resource details. The middleware reads this after
+	// Handle() returns and ships the completed event to the audit service.
+	domainaudit.AnnotateContext(r.Context(),
+		domainaudit.ResourceURL,
+		result.ID,
+		map[string]any{
+			"short_code":   result.ShortCode,
+			"original_url": result.OriginalURL,
+		},
+	)
 
 	if h.metrics != nil {
 		h.metrics.RecordURLShortened()
@@ -147,15 +139,10 @@ func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// resolveIdentity extracts workspace and user identity from the request.
-// Returns claims values if JWT middleware ran, falls back to headers otherwise.
 func resolveIdentity(r *http.Request) (workspaceID, userID string) {
-	// Try JWT claims first (Phase 2 path).
 	if claims, ok := domainauth.FromContext(r.Context()); ok {
 		return claims.WorkspaceID, claims.UserID
 	}
-
-	// Fallback to headers (Phase 1 stub / test path).
 	workspaceID = r.Header.Get("X-Workspace-ID")
 	if workspaceID == "" {
 		workspaceID = "ws_default"
@@ -175,8 +162,7 @@ func (h *ShortenHandler) writeError(w http.ResponseWriter, r *http.Request, err 
 	}
 	if errors.Is(err, apperrors.ErrShortCodeConflict) {
 		response.Conflict(w,
-			"The requested short code is already in use. "+
-				"Please choose a different code or omit it to generate one automatically.",
+			"The requested short code is already in use.",
 			r.URL.Path)
 		return
 	}
@@ -185,7 +171,7 @@ func (h *ShortenHandler) writeError(w http.ResponseWriter, r *http.Request, err 
 			Type:     response.ProblemTypeURLBlocked,
 			Title:    "URL Blocked",
 			Status:   http.StatusUnprocessableEntity,
-			Detail:   "This URL has been flagged by our safety policy and cannot be shortened.",
+			Detail:   "This URL has been flagged by our safety policy.",
 			Instance: r.URL.Path,
 		})
 		return

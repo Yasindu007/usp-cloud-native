@@ -15,6 +15,7 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
 	appkey "github.com/urlshortener/platform/internal/application/apikey"
+	appaudit "github.com/urlshortener/platform/internal/application/audit"
 	"github.com/urlshortener/platform/internal/application/shorten"
 	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
 	"github.com/urlshortener/platform/internal/config"
@@ -30,6 +31,7 @@ import (
 	"github.com/urlshortener/platform/pkg/shortcode"
 	"github.com/urlshortener/platform/pkg/telemetry"
 
+	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
 	"github.com/urlshortener/platform/internal/domain/ratelimit"
 	domainworkspace "github.com/urlshortener/platform/internal/domain/workspace"
@@ -60,13 +62,10 @@ func main() {
 	ctx := context.Background()
 
 	otelShutdown, err := telemetry.InitTracer(ctx, telemetry.Config{
-		Enabled:        cfg.OTelEnabled,
-		Exporter:       cfg.OTelExporter,
-		OTLPEndpoint:   cfg.OTelEndpoint,
-		ServiceName:    cfg.ServiceName,
-		ServiceVersion: version,
-		Environment:    cfg.Environment,
-		SampleRate:     cfg.OTelSampleRate,
+		Enabled: cfg.OTelEnabled, Exporter: cfg.OTelExporter,
+		OTLPEndpoint: cfg.OTelEndpoint, ServiceName: cfg.ServiceName,
+		ServiceVersion: version, Environment: cfg.Environment,
+		SampleRate: cfg.OTelSampleRate,
 	})
 	if err != nil {
 		log.Error("otel init failed", slog.String("error", err.Error()))
@@ -101,17 +100,13 @@ func main() {
 	}
 
 	// ── Rate limiter ──────────────────────────────────────────────────────────
-	// The rate limiter is a thin wrapper around the Redis client.
-	// It is nil-safe — middleware handles nil limiter gracefully (fail-open).
 	var tokenBucketLimiter *redisinfra.TokenBucketLimiter
 	if redisClient != nil {
 		tokenBucketLimiter = redisinfra.NewTokenBucketLimiter(redisClient)
-		log.Info("rate limiter enabled (redis token bucket)")
-	} else {
-		log.Warn("rate limiter disabled — Redis not configured")
+		log.Info("rate limiter enabled")
 	}
 
-	// ── JWT auth config ────────────────────────────────────────────────────────
+	// ── JWT auth ──────────────────────────────────────────────────────────────
 	var authCfg *httpmiddleware.AuthConfig
 	if cfg.JWTPublicKeyPath != "" {
 		keySet, err := jwtutil.LoadPublicKeyAsJWKSet(cfg.JWTPublicKeyPath)
@@ -139,15 +134,32 @@ func main() {
 	var urlRepo *postgres.URLRepository
 	var wsRepo *postgres.WorkspaceRepository
 	var keyRepo *postgres.APIKeyRepository
+	var auditRepo *postgres.AuditRepository
+
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
 		wsRepo = postgres.NewWorkspaceRepository(dbClient)
 		keyRepo = postgres.NewAPIKeyRepository(dbClient)
+		auditRepo = postgres.NewAuditRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
 	if redisClient != nil {
 		urlCache = redisinfra.NewURLCache(redisClient)
+	}
+
+	// ── Audit service ─────────────────────────────────────────────────────────
+	// The audit service starts its background goroutine here.
+	// It runs until the application context is cancelled.
+	// We use a separate context so we can control shutdown order:
+	// Stop accepting HTTP first, then flush audit events.
+	auditCtx, auditCancel := context.WithCancel(ctx)
+	var auditSvc *appaudit.Service
+	if auditRepo != nil {
+		auditSvc = appaudit.NewService(auditCtx, auditRepo, log)
+		log.Info("audit service started")
+	} else {
+		log.Warn("audit service disabled — database not configured")
 	}
 
 	// ── Application layer ─────────────────────────────────────────────────────
@@ -184,12 +196,7 @@ func main() {
 		keyListH = appkey.NewListHandler(keyRepo, wsRepo)
 	}
 
-	// ── Rate limit middleware factories ────────────────────────────────────────
-	// We create one middleware instance per endpoint class.
-	// Each class has different token bucket parameters (policy matrix).
-	//
-	// The limiter is nil-safe: if tokenBucketLimiter is nil, we pass a
-	// no-op limiter that always returns allowed=true (fail-open by design).
+	// ── Rate limit middleware ─────────────────────────────────────────────────
 	var effectiveLimiter httpmiddleware.Limiter
 	if tokenBucketLimiter != nil {
 		effectiveLimiter = tokenBucketLimiter
@@ -198,26 +205,27 @@ func main() {
 	}
 
 	rlRead := httpmiddleware.RateLimit(httpmiddleware.RateLimitConfig{
-		Limiter:       effectiveLimiter,
-		ServiceName:   cfg.ServiceName,
-		Metrics:       appMetrics,
-		EndpointClass: ratelimit.ClassRead,
-		Log:           log,
-		FailOpen:      true,
+		Limiter: effectiveLimiter, ServiceName: cfg.ServiceName,
+		EndpointClass: ratelimit.ClassRead, Log: log, FailOpen: true,
 	})
 	rlWrite := httpmiddleware.RateLimit(httpmiddleware.RateLimitConfig{
-		Limiter:       effectiveLimiter,
-		ServiceName:   cfg.ServiceName,
-		Metrics:       appMetrics,
-		EndpointClass: ratelimit.ClassWrite,
-		Log:           log,
-		FailOpen:      true,
+		Limiter: effectiveLimiter, ServiceName: cfg.ServiceName,
+		EndpointClass: ratelimit.ClassWrite, Log: log, FailOpen: true,
 	})
+
+	// ── Audit middleware factory ───────────────────────────────────────────────
+	// auditOf wraps a handler with audit capture for a specific action.
+	// Returns a no-op middleware when audit service is nil.
+	auditOf := func(action domainaudit.Action) func(http.Handler) http.Handler {
+		if auditSvc == nil {
+			return func(next http.Handler) http.Handler { return next }
+		}
+		return httpmiddleware.AuditAction(auditSvc, action)
+	}
 
 	// ── Router ────────────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Global middleware — applied to all routes.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(httpmiddleware.OTel(cfg.ServiceName))
@@ -232,7 +240,7 @@ func main() {
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// ── Authentication (dual: API key → JWT) ──────────────────────────────
+		// Authentication
 		if keyRepo != nil {
 			r.Use(httpmiddleware.APIKeyAuth(keyRepo, log))
 		}
@@ -243,14 +251,15 @@ func main() {
 		// Token revocation
 		if authCfg != nil && redisClient != nil {
 			dl := infraauth.NewDenyList(redisClient.RDB())
-			r.Delete("/auth/token", revokeTokenHandler(dl, log))
+			r.With(auditOf(domainaudit.ActionTokenRevoke)).
+				Delete("/auth/token", revokeTokenHandler(dl, log))
 		}
 
-		// Workspace create + list (no workspace context)
+		// Workspace create/list
 		if wsCreateH != nil {
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
-			// Creating a workspace: rate limit as a write operation.
-			r.With(rlWrite).Post("/workspaces", wsH.Create)
+			r.With(rlWrite, auditOf(domainaudit.ActionWorkspaceCreate)).
+				Post("/workspaces", wsH.Create)
 			r.With(rlRead).Get("/workspaces", wsH.List)
 		}
 
@@ -261,40 +270,39 @@ func main() {
 			}
 
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
-
 			r.With(rlRead).Get("/", wsH.Get)
-
-			r.With(rlWrite,
-				httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+			r.With(rlWrite, httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				auditOf(domainaudit.ActionMemberAdd),
 			).Post("/members", wsH.AddMember)
 			r.With(rlRead).Get("/members", wsH.ListMembers)
 
-			// URL routes
+			// URLs
 			r.Route("/urls", func(r chi.Router) {
 				if shortenUseCase != nil {
 					r.With(rlWrite,
 						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
+						auditOf(domainaudit.ActionURLCreate),
 					).Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 				}
 			})
 
-			// API key routes
+			// API keys
 			if keyCreateH != nil {
 				keyH := handler.NewAPIKeyHandler(keyCreateH, keyRevokeH, keyListH, log)
 				r.With(rlRead).Get("/api-keys", keyH.List)
-				r.With(rlWrite,
-					httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				r.With(rlWrite, httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+					auditOf(domainaudit.ActionAPIKeyCreate),
 				).Post("/api-keys", keyH.Create)
-				r.With(rlWrite,
-					httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				r.With(rlWrite, httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+					auditOf(domainaudit.ActionAPIKeyRevoke),
 				).Delete("/api-keys/{keyID}", keyH.Revoke)
 			}
 		})
 
-		// Legacy route — backwards compat
+		// Legacy route
 		if shortenUseCase != nil {
-			r.With(rlWrite).Post("/urls",
-				handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+			r.With(rlWrite, auditOf(domainaudit.ActionURLCreate)).
+				Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 		}
 	})
 
@@ -337,23 +345,41 @@ func main() {
 	}
 
 	statsCancel()
+
+	// ── Ordered shutdown ──────────────────────────────────────────────────────
+	// 1. Stop HTTP servers (no new requests)
+	// 2. Cancel audit goroutine context
+	// 3. Flush remaining audit events (Shutdown drains the channel)
+	// 4. Close DB and Redis connections
+	// 5. Flush OTel spans
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)
 	defer cancel()
 
+	log.Info("stopping http server")
 	_ = srv.Shutdown(shutdownCtx)
 	_ = metricsSrv.Shutdown(shutdownCtx)
+
+	if auditSvc != nil {
+		log.Info("flushing audit events")
+		auditCancel() // stop drainer goroutine
+		auditSvc.Shutdown(shutdownCtx)
+	}
+
 	if redisClient != nil {
 		_ = redisClient.Close()
 	}
 	if dbClient != nil {
 		dbClient.Close()
 	}
+
+	log.Info("flushing telemetry spans")
 	_ = otelShutdown(shutdownCtx)
 	log.Info("shutdown complete")
 }
 
-// noopLimiter always allows requests. Used when Redis is unavailable.
+// noopLimiter allows all requests (used when Redis unavailable).
 type noopLimiter struct{}
 
 func (n *noopLimiter) Check(_ context.Context, _ string, policy ratelimit.Policy) (*ratelimit.Result, error) {
@@ -380,6 +406,12 @@ func revokeTokenHandler(dl *infraauth.DenyList, log *slog.Logger) http.HandlerFu
 			response.InternalError(w, r.URL.Path)
 			return
 		}
+		// Annotation happens here — this is a direct handler, not using the
+		// standard handler pattern, so we annotate inline.
+		domainaudit.AnnotateContext(r.Context(),
+			domainaudit.ResourceToken, claims.TokenID,
+			map[string]any{"revoked_by": claims.UserID},
+		)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

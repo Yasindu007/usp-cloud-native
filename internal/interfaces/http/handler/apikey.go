@@ -13,12 +13,13 @@ import (
 
 	appkey "github.com/urlshortener/platform/internal/application/apikey"
 	"github.com/urlshortener/platform/internal/application/apperrors"
+	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
 )
 
-// ── Use case interfaces ───────────────────────────────────────────────────────
+// ── Use case interfaces ────────────────────────────────────────────────────────
 
 type APIKeyCreator interface {
 	Handle(ctx context.Context, cmd appkey.CreateCommand) (*appkey.CreateResult, error)
@@ -32,16 +33,16 @@ type APIKeyLister interface {
 	Handle(ctx context.Context, q appkey.ListQuery) ([]*appkey.KeySummary, error)
 }
 
-// ── Request / Response types ──────────────────────────────────────────────────
+// ── Request / Response ────────────────────────────────────────────────────────
 
-// CreateAPIKeyRequest is the JSON body for POST /api-keys.
 type CreateAPIKeyRequest struct {
 	Name      string     `json:"name"`
 	Scopes    []string   `json:"scopes"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
-// APIKeyHandler handles all API key HTTP endpoints.
+// ── APIKeyHandler ─────────────────────────────────────────────────────────────
+
 type APIKeyHandler struct {
 	creator APIKeyCreator
 	revoker APIKeyRevoker
@@ -49,7 +50,6 @@ type APIKeyHandler struct {
 	log     *slog.Logger
 }
 
-// NewAPIKeyHandler constructs an APIKeyHandler.
 func NewAPIKeyHandler(
 	creator APIKeyCreator,
 	revoker APIKeyRevoker,
@@ -59,12 +59,7 @@ func NewAPIKeyHandler(
 	return &APIKeyHandler{creator: creator, revoker: revoker, lister: lister, log: log}
 }
 
-// Create handles POST /api/v1/workspaces/{workspaceID}/api-keys
-//
-// Response MUST include the raw key in the "raw_key" field.
-// After this response the raw key is gone — the user cannot retrieve it again.
-// The response body includes a prominent "store_now" warning field to
-// reinforce this to API clients.
+// Create handles POST /api/v1/workspaces/{workspaceID}/api-keys.
 func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	log := logger.FromContext(r.Context()).With(
 		slog.String("handler", "APIKeyHandler.Create"),
@@ -101,21 +96,28 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Info("api key created via http",
-		slog.String("key_id", result.ID),
-		slog.String("workspace_id", result.WorkspaceID),
-		// NOTE: raw key is intentionally not logged
+	// Audit annotation — note: key_prefix is safe to log; raw_key is NOT.
+	domainaudit.AnnotateContext(r.Context(),
+		domainaudit.ResourceAPIKey,
+		result.ID,
+		map[string]any{
+			"name":       result.Name,
+			"key_prefix": result.KeyPrefix,
+			"scopes":     result.Scopes,
+		},
 	)
 
-	// Include a prominent warning in the response body.
-	// This is best practice for services that issue long-lived secrets —
-	// GitHub, Stripe, and AWS all include similar warnings.
+	log.Info("api key created",
+		slog.String("key_id", result.ID),
+		slog.String("workspace_id", result.WorkspaceID),
+	)
+
 	response.JSON(w, http.StatusCreated, response.Envelope{
 		Data: map[string]any{
 			"id":           result.ID,
 			"name":         result.Name,
 			"key_prefix":   result.KeyPrefix,
-			"raw_key":      result.RawKey, // SHOW ONCE
+			"raw_key":      result.RawKey,
 			"store_now":    "This is the only time the key will be shown. Store it securely now.",
 			"scopes":       result.Scopes,
 			"workspace_id": result.WorkspaceID,
@@ -125,7 +127,7 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// List handles GET /api/v1/workspaces/{workspaceID}/api-keys
+// List handles GET /api/v1/workspaces/{workspaceID}/api-keys.
 func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
@@ -135,9 +137,7 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
 	workspaceID := chi.URLParam(r, "workspaceID")
-
 	results, err := h.lister.Handle(r.Context(), appkey.ListQuery{
 		WorkspaceID:      workspaceID,
 		RequestingUserID: claims.UserID,
@@ -146,15 +146,12 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err, logger.FromContext(r.Context()))
 		return
 	}
-
 	response.JSON(w, http.StatusOK, response.Envelope{Data: results})
 }
 
-// Revoke handles DELETE /api/v1/workspaces/{workspaceID}/api-keys/{keyID}
+// Revoke handles DELETE /api/v1/workspaces/{workspaceID}/api-keys/{keyID}.
 func (h *APIKeyHandler) Revoke(w http.ResponseWriter, r *http.Request) {
-	log := logger.FromContext(r.Context()).With(
-		slog.String("handler", "APIKeyHandler.Revoke"),
-	)
+	log := logger.FromContext(r.Context()).With(slog.String("handler", "APIKeyHandler.Revoke"))
 
 	claims, ok := domainauth.FromContext(r.Context())
 	if !ok {
@@ -178,10 +175,15 @@ func (h *APIKeyHandler) Revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audit annotation for revocation
+	domainaudit.AnnotateContext(r.Context(),
+		domainaudit.ResourceAPIKey,
+		keyID,
+		map[string]any{"revoked_by": claims.UserID},
+	)
+
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// ── Error mapping ─────────────────────────────────────────────────────────────
 
 func (h *APIKeyHandler) writeError(w http.ResponseWriter, r *http.Request, err error, log *slog.Logger) {
 	var ve *apperrors.ValidationError
@@ -191,8 +193,7 @@ func (h *APIKeyHandler) writeError(w http.ResponseWriter, r *http.Request, err e
 	}
 	if errors.Is(err, apperrors.ErrUnauthorized) {
 		response.WriteProblem(w, response.Problem{
-			Type:   response.ProblemTypeUnauthorized,
-			Title:  "Forbidden",
+			Type: response.ProblemTypeUnauthorized, Title: "Forbidden",
 			Status: http.StatusForbidden,
 			Detail: "You do not have permission to perform this action.",
 		})
@@ -203,8 +204,6 @@ func (h *APIKeyHandler) writeError(w http.ResponseWriter, r *http.Request, err e
 		return
 	}
 	log.Error("unexpected error in api key handler",
-		slog.String("error", err.Error()),
-		slog.String("path", r.URL.Path),
-	)
+		slog.String("error", err.Error()), slog.String("path", r.URL.Path))
 	response.InternalError(w, r.URL.Path)
 }
