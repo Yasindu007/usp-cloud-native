@@ -76,6 +76,11 @@ type AuthConfig struct {
 func Authenticate(cfg AuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := domainauth.FromContext(r.Context()); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			log := logger.FromContext(r.Context())
 
 			// Step 1: Extract Bearer token

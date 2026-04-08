@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	appkey "github.com/urlshortener/platform/internal/application/apikey"
 	"github.com/urlshortener/platform/internal/application/shorten"
 	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
 	"github.com/urlshortener/platform/internal/config"
@@ -53,11 +54,7 @@ func main() {
 		slog.String("env", cfg.Environment),
 	)
 	slog.SetDefault(log)
-
-	log.Info("starting api-service",
-		slog.String("build_time", buildTime),
-		slog.String("port", cfg.APIPort),
-	)
+	log.Info("starting api-service", slog.String("port", cfg.APIPort))
 
 	ctx := context.Background()
 
@@ -68,44 +65,43 @@ func main() {
 		SampleRate: cfg.OTelSampleRate,
 	})
 	if err != nil {
-		log.Error("failed to initialize opentelemetry", slog.String("error", err.Error()))
+		log.Error("otel init failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
 	appMetrics := metrics.New(cfg.ServiceName, version, commit)
 
-	// ── PostgreSQL ────────────────────────────────────────────────────────────
+	// ── Infrastructure ────────────────────────────────────────────────────────
 	var dbClient *postgres.Client
 	if cfg.DBPrimaryDSN != "" {
 		dbCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		dbClient, err = postgres.New(dbCtx, cfg)
 		cancel()
 		if err != nil {
-			log.Error("failed to connect to postgresql", slog.String("error", err.Error()))
+			log.Error("db connect failed", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 		log.Info("postgresql connected")
 	}
 
-	// ── Redis ─────────────────────────────────────────────────────────────────
 	var redisClient *redisinfra.Client
 	if cfg.RedisAddr != "" {
 		redisCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		redisClient, err = redisinfra.New(redisCtx, cfg)
 		cancel()
 		if err != nil {
-			log.Error("failed to connect to redis", slog.String("error", err.Error()))
+			log.Error("redis connect failed", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 		log.Info("redis connected")
 	}
 
-	// ── JWT auth configuration ─────────────────────────────────────────────────
+	// ── JWT auth config ────────────────────────────────────────────────────────
 	var authCfg *httpmiddleware.AuthConfig
 	if cfg.JWTPublicKeyPath != "" {
 		keySet, err := jwtutil.LoadPublicKeyAsJWKSet(cfg.JWTPublicKeyPath)
 		if err != nil {
-			log.Error("failed to load JWT public key", slog.String("error", err.Error()))
+			log.Error("jwt key load failed", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 		ac := httpmiddleware.AuthConfig{
@@ -118,19 +114,21 @@ func main() {
 		authCfg = &ac
 		log.Info("jwt authentication enabled")
 	} else {
-		log.Warn("JWT_PUBLIC_KEY_PATH not set — authentication DISABLED")
+		log.Warn("JWT_PUBLIC_KEY_PATH not set — auth DISABLED")
 		if cfg.IsProduction() {
 			os.Exit(1)
 		}
 	}
 
-	// ── Infrastructure adapters ───────────────────────────────────────────────
+	// ── Adapters ──────────────────────────────────────────────────────────────
 	var urlRepo *postgres.URLRepository
 	var wsRepo *postgres.WorkspaceRepository
+	var keyRepo *postgres.APIKeyRepository
 
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
 		wsRepo = postgres.NewWorkspaceRepository(dbClient)
+		keyRepo = postgres.NewAPIKeyRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -150,21 +148,31 @@ func main() {
 	}
 
 	var (
-		wsCreateHandler   *appworkspace.CreateHandler
-		wsGetHandler      *appworkspace.GetHandler
-		wsListHandler     *appworkspace.ListHandler
-		memberAddHandler  *appworkspace.AddMemberHandler
-		memberListHandler *appworkspace.ListMembersHandler
+		wsCreateH   *appworkspace.CreateHandler
+		wsGetH      *appworkspace.GetHandler
+		wsListH     *appworkspace.ListHandler
+		memberAddH  *appworkspace.AddMemberHandler
+		memberListH *appworkspace.ListMembersHandler
+		keyCreateH  *appkey.CreateHandler
+		keyRevokeH  *appkey.RevokeHandler
+		keyListH    *appkey.ListHandler
 	)
+
 	if wsRepo != nil {
-		wsCreateHandler = appworkspace.NewCreateHandler(wsRepo, log)
-		wsGetHandler = appworkspace.NewGetHandler(wsRepo, wsRepo)
-		wsListHandler = appworkspace.NewListHandler(wsRepo, wsRepo)
-		memberAddHandler = appworkspace.NewAddMemberHandler(wsRepo, wsRepo, log)
-		memberListHandler = appworkspace.NewListMembersHandler(wsRepo)
+		wsCreateH = appworkspace.NewCreateHandler(wsRepo, log)
+		wsGetH = appworkspace.NewGetHandler(wsRepo, wsRepo)
+		wsListH = appworkspace.NewListHandler(wsRepo, wsRepo)
+		memberAddH = appworkspace.NewAddMemberHandler(wsRepo, wsRepo, log)
+		memberListH = appworkspace.NewListMembersHandler(wsRepo)
 	}
 
-	// ── HTTP router ───────────────────────────────────────────────────────────
+	if keyRepo != nil && wsRepo != nil {
+		keyCreateH = appkey.NewCreateHandler(keyRepo, log)
+		keyRevokeH = appkey.NewRevokeHandler(keyRepo, wsRepo, log)
+		keyListH = appkey.NewListHandler(keyRepo, wsRepo)
+	}
+
+	// ── Router ────────────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
@@ -180,89 +188,75 @@ func main() {
 	})
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
-	// ── /api/v1 — authenticated routes ───────────────────────────────────────
 	r.Route("/api/v1", func(r chi.Router) {
-		// JWT authentication gate
+		// ── Dual authentication: API key first, JWT second ─────────────────────
+		// APIKeyAuth runs first. If an API key is found, it injects Claims and
+		// the JWT middleware is a no-op. If no API key is present, Authenticate
+		// checks for a Bearer JWT. If neither authenticates: 401.
+		if keyRepo != nil {
+			r.Use(httpmiddleware.APIKeyAuth(keyRepo, log))
+		}
 		if authCfg != nil {
 			r.Use(httpmiddleware.Authenticate(*authCfg))
 		}
 
-		// Token revocation (logout) — auth only, no workspace context needed
+		// Token revocation (JWT only)
 		if authCfg != nil && redisClient != nil {
 			dl := infraauth.NewDenyList(redisClient.RDB())
 			r.Delete("/auth/token", revokeTokenHandler(dl, log))
 		}
 
-		// ── Workspace management ──────────────────────────────────────────────
-		// POST /workspaces — create a workspace (no workspace context needed,
-		//   the user is creating a new one)
-		if wsCreateHandler != nil {
-			r.Post("/workspaces", handler.NewWorkspaceHandler(
-				wsCreateHandler, wsGetHandler, wsListHandler,
-				memberAddHandler, memberListHandler, log,
-			).Create)
+		// Workspace creation and listing (no workspace context needed)
+		if wsCreateH != nil {
+			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
+			r.Post("/workspaces", wsH.Create)
+			r.Get("/workspaces", wsH.List)
 		}
 
-		// GET /workspaces — list workspaces for the current user
-		if wsListHandler != nil {
-			r.Get("/workspaces", handler.NewWorkspaceHandler(
-				wsCreateHandler, wsGetHandler, wsListHandler,
-				memberAddHandler, memberListHandler, log,
-			).List)
-		}
-
-		// ── Workspace-scoped routes: WorkspaceAuth verifies membership ────────
-		// All routes under /workspaces/{workspaceID} require the caller to be
-		// a member of the specified workspace. WorkspaceAuth enforces this and
-		// stores the Member (with role) in context for downstream handlers.
+		// Workspace-scoped routes — WorkspaceAuth enforces membership
 		r.Route("/workspaces/{workspaceID}", func(r chi.Router) {
 			if wsRepo != nil {
 				r.Use(httpmiddleware.WorkspaceAuth(wsRepo))
 			}
 
-			wsHandler := handler.NewWorkspaceHandler(
-				wsCreateHandler, wsGetHandler, wsListHandler,
-				memberAddHandler, memberListHandler, log,
-			)
+			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
+			r.Get("/", wsH.Get)
 
-			// GET /workspaces/{workspaceID} — any member role
-			r.Get("/", wsHandler.Get)
+			r.With(httpmiddleware.RequireAction(domainworkspace.ActionManageMembers)).
+				Post("/members", wsH.AddMember)
+			r.Get("/members", wsH.ListMembers)
 
-			// POST /workspaces/{workspaceID}/members — requires ManageMembers
-			r.With(
-				httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
-			).Post("/members", wsHandler.AddMember)
-
-			// GET /workspaces/{workspaceID}/members — any member role
-			r.Get("/members", wsHandler.ListMembers)
-
-			// ── URL routes scoped to workspace ────────────────────────────────
+			// URLs
 			r.Route("/urls", func(r chi.Router) {
-				// POST — requires write permission (editor, admin, owner)
 				if shortenUseCase != nil {
-					r.With(
-						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
-					).Post("/",
-						handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+					r.With(httpmiddleware.RequireAction(domainworkspace.ActionCreateURL)).
+						Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 				}
-				// TODO(story-2.6): GET /, GET /{id}, PATCH /{id}, DELETE /{id}
 			})
+
+			// API keys
+			if keyCreateH != nil {
+				keyH := handler.NewAPIKeyHandler(keyCreateH, keyRevokeH, keyListH, log)
+				r.Get("/api-keys", keyH.List)
+				// Creating and revoking keys requires admin/owner
+				r.With(httpmiddleware.RequireAction(domainworkspace.ActionManageMembers)).
+					Post("/api-keys", keyH.Create)
+				r.With(httpmiddleware.RequireAction(domainworkspace.ActionManageMembers)).
+					Delete("/api-keys/{keyID}", keyH.Revoke)
+			}
 		})
 
-		// Legacy /urls route (backwards compat during Phase 1 → Phase 2 migration)
-		// Will be removed once all clients use /workspaces/{id}/urls
+		// Legacy route — backwards compat
 		if shortenUseCase != nil {
-			r.Post("/urls",
-				handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+			r.Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 		}
 	})
 
-	// ── Metrics server ────────────────────────────────────────────────────────
+	// ── Servers ───────────────────────────────────────────────────────────────
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", appMetrics.Handler())
 	metricsSrv := &http.Server{Addr: ":" + cfg.MetricsPort, Handler: metricsMux}
 
-	// ── Application server ────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         ":" + cfg.APIPort,
 		Handler:      r,
@@ -275,11 +269,10 @@ func main() {
 	go func() {
 		log.Info("http server listening", slog.String("addr", srv.Addr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- fmt.Errorf("http server error: %w", err)
+			serverErr <- fmt.Errorf("http: %w", err)
 		}
 	}()
 	go func() {
-		log.Info("metrics server listening", slog.String("addr", metricsSrv.Addr))
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics server error", slog.String("error", err.Error()))
 		}
@@ -326,11 +319,10 @@ func revokeTokenHandler(dl *infraauth.DenyList, log *slog.Logger) http.HandlerFu
 			return
 		}
 		if err := dl.Revoke(r.Context(), claims.TokenID, claims.ExpiresAt); err != nil {
-			log.Error("failed to revoke token", slog.String("error", err.Error()))
+			log.Error("revoke failed", slog.String("error", err.Error()))
 			response.InternalError(w, r.URL.Path)
 			return
 		}
-		log.Info("token revoked", slog.String("jti", claims.TokenID))
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -339,24 +331,18 @@ func readyHandler(log *slog.Logger, db *postgres.Client, cache *redisinfra.Clien
 	return func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-		if db == nil {
-			response.WriteProblem(w, response.Problem{
-				Type: response.ProblemTypeInternal, Title: "Not Ready",
-				Status: http.StatusServiceUnavailable, Detail: "database not configured",
-			})
-			return
-		}
-		if err := db.Ping(pingCtx); err != nil {
-			log.Warn("readiness: db ping failed")
-			response.WriteProblem(w, response.Problem{
-				Type: response.ProblemTypeInternal, Title: "Not Ready",
-				Status: http.StatusServiceUnavailable, Detail: "database unreachable",
-			})
-			return
+		if db != nil {
+			if err := db.Ping(pingCtx); err != nil {
+				log.Warn("readiness: db ping failed")
+				response.WriteProblem(w, response.Problem{
+					Type: response.ProblemTypeInternal, Title: "Not Ready",
+					Status: http.StatusServiceUnavailable, Detail: "database unreachable",
+				})
+				return
+			}
 		}
 		if cache != nil {
 			if err := cache.Ping(pingCtx); err != nil {
-				log.Warn("readiness: redis ping failed")
 				response.WriteProblem(w, response.Problem{
 					Type: response.ProblemTypeInternal, Title: "Not Ready",
 					Status: http.StatusServiceUnavailable, Detail: "cache unreachable",

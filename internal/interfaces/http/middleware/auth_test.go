@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -459,12 +460,3 @@ func TestRequireScope_MissingScope_Returns403(t *testing.T) {
 }
 
 // Missing import — add to file
-var errors = struct{ New func(string) error }{
-	New: func(s string) error {
-		return &strErr{s}
-	},
-}
-
-type strErr struct{ s string }
-
-func (e *strErr) Error() string { return e.s }
