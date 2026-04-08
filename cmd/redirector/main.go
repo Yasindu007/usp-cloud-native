@@ -24,6 +24,8 @@ import (
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
 	"github.com/urlshortener/platform/pkg/telemetry"
+
+	"github.com/urlshortener/platform/internal/domain/ratelimit"
 )
 
 var (
@@ -39,12 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The redirect service uses a different metrics port (9091) from the
-	// API service (9090) so both can run on the same host simultaneously.
 	redirectMetricsPort := "9091"
-	if p := cfg.MetricsPort; p != "9090" {
-		redirectMetricsPort = p
-	}
 
 	log := logger.New(cfg.LogLevel, cfg.LogFormat).With(
 		slog.String("service", "redirect-service"),
@@ -53,12 +50,7 @@ func main() {
 		slog.String("env", cfg.Environment),
 	)
 	slog.SetDefault(log)
-
-	log.Info("starting redirect-service",
-		slog.String("build_time", buildTime),
-		slog.String("port", cfg.RedirectPort),
-		slog.String("metrics_port", redirectMetricsPort),
-	)
+	log.Info("starting redirect-service", slog.String("port", cfg.RedirectPort))
 
 	ctx := context.Background()
 
@@ -72,7 +64,7 @@ func main() {
 		SampleRate:     cfg.OTelSampleRate,
 	})
 	if err != nil {
-		log.Error("failed to initialize opentelemetry", slog.String("error", err.Error()))
+		log.Error("otel init failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
@@ -84,7 +76,7 @@ func main() {
 		dbClient, err = postgres.New(dbCtx, cfg)
 		cancel()
 		if err != nil {
-			log.Error("failed to connect to postgresql", slog.String("error", err.Error()))
+			log.Error("db connect failed", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 		log.Info("postgresql connected")
@@ -96,10 +88,26 @@ func main() {
 		redisClient, err = redisinfra.New(redisCtx, cfg)
 		cancel()
 		if err != nil {
-			log.Error("failed to connect to redis", slog.String("error", err.Error()))
+			log.Error("redis connect failed", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
-		log.Info("redis connected", slog.String("addr", cfg.RedisAddr))
+		log.Info("redis connected")
+	}
+
+	// ── Rate limiter (redirect-specific policy) ───────────────────────────────
+	// The redirect service uses the ClassRedirect policy, which is
+	// significantly more permissive than write operations:
+	//   unauthenticated: 300 req/60s (vs 10 req/60s for writes)
+	//   free tier:      1000 req/60s (vs 100 req/60s for writes)
+	//
+	// This reflects the production reality: a single viral tweet can
+	// generate thousands of redirects in seconds. The redirect service
+	// must handle this gracefully. We rate limit only to prevent outright
+	// abuse, not to gate legitimate viral traffic.
+	var tokenBucketLimiter *redisinfra.TokenBucketLimiter
+	if redisClient != nil {
+		tokenBucketLimiter = redisinfra.NewTokenBucketLimiter(redisClient)
+		log.Info("rate limiter enabled (redirect class)")
 	}
 
 	var urlRepo *postgres.URLRepository
@@ -119,7 +127,30 @@ func main() {
 
 	redirectHTTPHandler := handler.NewRedirectHandler(resolveUseCase, log, appMetrics)
 
+	// Effective limiter (no-op if Redis unavailable)
+	var effectiveLimiter httpmiddleware.Limiter
+	if tokenBucketLimiter != nil {
+		effectiveLimiter = tokenBucketLimiter
+	} else {
+		effectiveLimiter = &noopLimiter{}
+	}
+
+	rlRedirect := httpmiddleware.RateLimit(httpmiddleware.RateLimitConfig{
+		Limiter:       effectiveLimiter,
+		ServiceName:   "redirect-service",
+		Metrics:       appMetrics,
+		EndpointClass: ratelimit.ClassRedirect,
+		Log:           log,
+		// Redirect service always fails open — a Redis blip must not
+		// take down link resolution. Availability SLO > rate limit enforcement.
+		FailOpen: true,
+	})
+
 	r := chi.NewRouter()
+
+	// Redirect service middleware — intentionally leaner than API service.
+	// No auth middleware: redirects are public (no JWT/API key needed).
+	// No WorkspaceAuth: redirects are not workspace-scoped operations.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(httpmiddleware.OTel("redirect-service"))
@@ -136,7 +167,6 @@ func main() {
 		defer cancel()
 		if dbClient != nil {
 			if err := dbClient.Ping(pingCtx); err != nil {
-				log.Warn("readiness: postgresql ping failed", slog.String("error", err.Error()))
 				response.WriteProblem(w, response.Problem{
 					Type: response.ProblemTypeInternal, Title: "Not Ready",
 					Status: http.StatusServiceUnavailable, Detail: "database unreachable",
@@ -146,7 +176,6 @@ func main() {
 		}
 		if redisClient != nil {
 			if err := redisClient.Ping(pingCtx); err != nil {
-				log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
 				response.WriteProblem(w, response.Problem{
 					Type: response.ProblemTypeInternal, Title: "Not Ready",
 					Status: http.StatusServiceUnavailable, Detail: "cache unreachable",
@@ -157,14 +186,14 @@ func main() {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
-	r.Get("/{shortcode}", redirectHTTPHandler.Handle)
+	// The redirect route — rate limited per IP (no auth on this service).
+	// Rate limit applied PER ROUTE so health probes are never rate limited.
+	r.With(rlRedirect).Get("/{shortcode}", redirectHTTPHandler.Handle)
 
+	// Metrics server
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", appMetrics.Handler())
-	metricsSrv := &http.Server{
-		Addr:    ":" + redirectMetricsPort,
-		Handler: metricsMux,
-	}
+	metricsSrv := &http.Server{Addr: ":" + redirectMetricsPort, Handler: metricsMux}
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.RedirectPort,
@@ -178,23 +207,38 @@ func main() {
 	go func() {
 		log.Info("http server listening", slog.String("addr", srv.Addr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- fmt.Errorf("http server error: %w", err)
+			serverErr <- fmt.Errorf("http: %w", err)
 		}
 	}()
-
 	go func() {
-		log.Info("metrics server listening", slog.String("addr", metricsSrv.Addr))
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics server error", slog.String("error", err.Error()))
 		}
 	}()
 
 	statsCtx, statsCancel := context.WithCancel(ctx)
-	go collectPoolStats(statsCtx, appMetrics, dbClient, redisClient)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-statsCtx.Done():
+				return
+			case <-ticker.C:
+				if dbClient != nil {
+					s := dbClient.PrimaryStats()
+					appMetrics.UpdateDBPoolStats("primary", s.TotalConns, s.IdleConns, s.AcquiredConns, s.MaxConns)
+				}
+				if redisClient != nil {
+					s := redisClient.Stats()
+					appMetrics.UpdateCachePoolStats(s.TotalConns, s.IdleConns, s.StaleConns)
+				}
+			}
+		}
+	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
 	select {
 	case err := <-serverErr:
 		log.Error("server error", slog.String("error", err.Error()))
@@ -203,53 +247,30 @@ func main() {
 	}
 
 	statsCancel()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(cfg.RedirectShutdownTimeoutS)*time.Second)
+	defer cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(
-		context.Background(),
-		time.Duration(cfg.RedirectShutdownTimeoutS)*time.Second,
-	)
-	defer shutdownCancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error("shutdown error", slog.String("error", err.Error()))
-	}
-	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
-		log.Error("metrics shutdown error", slog.String("error", err.Error()))
-	}
+	_ = srv.Shutdown(shutdownCtx)
+	_ = metricsSrv.Shutdown(shutdownCtx)
 	if redisClient != nil {
 		_ = redisClient.Close()
 	}
 	if dbClient != nil {
 		dbClient.Close()
 	}
-	if err := otelShutdown(shutdownCtx); err != nil {
-		log.Error("otel shutdown error", slog.String("error", err.Error()))
-	}
-
+	_ = otelShutdown(shutdownCtx)
 	log.Info("shutdown complete")
 }
 
-func collectPoolStats(
-	ctx context.Context,
-	m *metrics.Metrics,
-	db *postgres.Client,
-	cache *redisinfra.Client,
-) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if db != nil {
-				s := db.PrimaryStats()
-				m.UpdateDBPoolStats("primary", s.TotalConns, s.IdleConns, s.AcquiredConns, s.MaxConns)
-			}
-			if cache != nil {
-				s := cache.Stats()
-				m.UpdateCachePoolStats(s.TotalConns, s.IdleConns, s.StaleConns)
-			}
-		}
-	}
+// noopLimiter always allows requests — used when Redis is unavailable.
+type noopLimiter struct{}
+
+func (n *noopLimiter) Check(_ context.Context, _ string, policy ratelimit.Policy) (*ratelimit.Result, error) {
+	return &ratelimit.Result{
+		Allowed:   true,
+		Remaining: policy.BucketCapacity(),
+		Limit:     policy.BucketCapacity(),
+		ResetAt:   time.Now().Add(policy.Window),
+	}, nil
 }

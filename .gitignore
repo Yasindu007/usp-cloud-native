@@ -50,3 +50,5 @@ vendor/
 *.crt
 *.p12
 !certs/README.md
+
+.gocache

@@ -89,6 +89,8 @@ type Metrics struct {
 	// Intentionally has no workspace_id label — would create unbounded cardinality.
 	URLsShortenedTotal prometheus.Counter
 
+	RateLimitTotal *prometheus.CounterVec
+
 	// ── Infrastructure: PostgreSQL ───────────────────────────────────────────
 	// DBPoolConnections exposes connection pool statistics per pool.
 	// Updated by a background goroutine every 15 seconds.
@@ -169,6 +171,12 @@ func New(serviceName, version, commit string) *Metrics {
 			Help:      "Total number of URLs successfully shortened since process start.",
 		}),
 
+		RateLimitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "urlshortener",
+			Name:      "rate_limit_checks_total",
+			Help:      "Total rate limit checks by outcome.",
+		}, []string{"service", "tier", "class", "result"}),
+
 		DBPoolConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "urlshortener",
 			Name:      "db_pool_connections",
@@ -194,6 +202,7 @@ func New(serviceName, version, commit string) *Metrics {
 		m.HTTPRequestDuration,
 		m.RedirectsTotal,
 		m.URLsShortenedTotal,
+		m.RateLimitTotal,
 		m.DBPoolConnections,
 		m.CachePoolConnections,
 		m.BuildInfo,
@@ -239,6 +248,11 @@ func (m *Metrics) RecordRedirect(cacheStatus string) {
 // Called by the shorten HTTP handler on every successful 201 response.
 func (m *Metrics) RecordURLShortened() {
 	m.URLsShortenedTotal.Inc()
+}
+
+// RecordRateLimit records the outcome of a rate limit check.
+func (m *Metrics) RecordRateLimit(service, tier, class, result string) {
+	m.RateLimitTotal.WithLabelValues(service, tier, class, result).Inc()
 }
 
 // UpdateDBPoolStats sets the current connection pool gauge values.

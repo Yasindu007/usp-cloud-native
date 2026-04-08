@@ -152,6 +152,28 @@ func TestMetrics_RecordURLShortened_Increments(t *testing.T) {
 	}
 }
 
+func TestMetrics_RecordRateLimit_Increments(t *testing.T) {
+	m := newTestMetrics()
+
+	m.RecordRateLimit("api-service", "free", "write", "allowed")
+	m.RecordRateLimit("api-service", "free", "write", "allowed")
+	m.RecordRateLimit("api-service", "free", "write", "denied")
+
+	allowed := testutil.ToFloat64(
+		m.RateLimitTotal.WithLabelValues("api-service", "free", "write", "allowed"),
+	)
+	if allowed != 2 {
+		t.Errorf("expected allowed count=2, got %v", allowed)
+	}
+
+	denied := testutil.ToFloat64(
+		m.RateLimitTotal.WithLabelValues("api-service", "free", "write", "denied"),
+	)
+	if denied != 1 {
+		t.Errorf("expected denied count=1, got %v", denied)
+	}
+}
+
 // ── DBPoolConnections ─────────────────────────────────────────────────────────
 
 func TestMetrics_UpdateDBPoolStats_SetsGauges(t *testing.T) {

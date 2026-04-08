@@ -31,6 +31,7 @@ import (
 	"github.com/urlshortener/platform/pkg/telemetry"
 
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
+	"github.com/urlshortener/platform/internal/domain/ratelimit"
 	domainworkspace "github.com/urlshortener/platform/internal/domain/workspace"
 )
 
@@ -59,10 +60,13 @@ func main() {
 	ctx := context.Background()
 
 	otelShutdown, err := telemetry.InitTracer(ctx, telemetry.Config{
-		Enabled: cfg.OTelEnabled, Exporter: cfg.OTelExporter,
-		OTLPEndpoint: cfg.OTelEndpoint, ServiceName: cfg.ServiceName,
-		ServiceVersion: version, Environment: cfg.Environment,
-		SampleRate: cfg.OTelSampleRate,
+		Enabled:        cfg.OTelEnabled,
+		Exporter:       cfg.OTelExporter,
+		OTLPEndpoint:   cfg.OTelEndpoint,
+		ServiceName:    cfg.ServiceName,
+		ServiceVersion: version,
+		Environment:    cfg.Environment,
+		SampleRate:     cfg.OTelSampleRate,
 	})
 	if err != nil {
 		log.Error("otel init failed", slog.String("error", err.Error()))
@@ -96,6 +100,17 @@ func main() {
 		log.Info("redis connected")
 	}
 
+	// ── Rate limiter ──────────────────────────────────────────────────────────
+	// The rate limiter is a thin wrapper around the Redis client.
+	// It is nil-safe — middleware handles nil limiter gracefully (fail-open).
+	var tokenBucketLimiter *redisinfra.TokenBucketLimiter
+	if redisClient != nil {
+		tokenBucketLimiter = redisinfra.NewTokenBucketLimiter(redisClient)
+		log.Info("rate limiter enabled (redis token bucket)")
+	} else {
+		log.Warn("rate limiter disabled — Redis not configured")
+	}
+
 	// ── JWT auth config ────────────────────────────────────────────────────────
 	var authCfg *httpmiddleware.AuthConfig
 	if cfg.JWTPublicKeyPath != "" {
@@ -124,7 +139,6 @@ func main() {
 	var urlRepo *postgres.URLRepository
 	var wsRepo *postgres.WorkspaceRepository
 	var keyRepo *postgres.APIKeyRepository
-
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
 		wsRepo = postgres.NewWorkspaceRepository(dbClient)
@@ -157,7 +171,6 @@ func main() {
 		keyRevokeH  *appkey.RevokeHandler
 		keyListH    *appkey.ListHandler
 	)
-
 	if wsRepo != nil {
 		wsCreateH = appworkspace.NewCreateHandler(wsRepo, log)
 		wsGetH = appworkspace.NewGetHandler(wsRepo, wsRepo)
@@ -165,16 +178,46 @@ func main() {
 		memberAddH = appworkspace.NewAddMemberHandler(wsRepo, wsRepo, log)
 		memberListH = appworkspace.NewListMembersHandler(wsRepo)
 	}
-
 	if keyRepo != nil && wsRepo != nil {
 		keyCreateH = appkey.NewCreateHandler(keyRepo, log)
 		keyRevokeH = appkey.NewRevokeHandler(keyRepo, wsRepo, log)
 		keyListH = appkey.NewListHandler(keyRepo, wsRepo)
 	}
 
+	// ── Rate limit middleware factories ────────────────────────────────────────
+	// We create one middleware instance per endpoint class.
+	// Each class has different token bucket parameters (policy matrix).
+	//
+	// The limiter is nil-safe: if tokenBucketLimiter is nil, we pass a
+	// no-op limiter that always returns allowed=true (fail-open by design).
+	var effectiveLimiter httpmiddleware.Limiter
+	if tokenBucketLimiter != nil {
+		effectiveLimiter = tokenBucketLimiter
+	} else {
+		effectiveLimiter = &noopLimiter{}
+	}
+
+	rlRead := httpmiddleware.RateLimit(httpmiddleware.RateLimitConfig{
+		Limiter:       effectiveLimiter,
+		ServiceName:   cfg.ServiceName,
+		Metrics:       appMetrics,
+		EndpointClass: ratelimit.ClassRead,
+		Log:           log,
+		FailOpen:      true,
+	})
+	rlWrite := httpmiddleware.RateLimit(httpmiddleware.RateLimitConfig{
+		Limiter:       effectiveLimiter,
+		ServiceName:   cfg.ServiceName,
+		Metrics:       appMetrics,
+		EndpointClass: ratelimit.ClassWrite,
+		Log:           log,
+		FailOpen:      true,
+	})
+
 	// ── Router ────────────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
+	// Global middleware — applied to all routes.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(httpmiddleware.OTel(cfg.ServiceName))
@@ -189,10 +232,7 @@ func main() {
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// ── Dual authentication: API key first, JWT second ─────────────────────
-		// APIKeyAuth runs first. If an API key is found, it injects Claims and
-		// the JWT middleware is a no-op. If no API key is present, Authenticate
-		// checks for a Bearer JWT. If neither authenticates: 401.
+		// ── Authentication (dual: API key → JWT) ──────────────────────────────
 		if keyRepo != nil {
 			r.Use(httpmiddleware.APIKeyAuth(keyRepo, log))
 		}
@@ -200,55 +240,61 @@ func main() {
 			r.Use(httpmiddleware.Authenticate(*authCfg))
 		}
 
-		// Token revocation (JWT only)
+		// Token revocation
 		if authCfg != nil && redisClient != nil {
 			dl := infraauth.NewDenyList(redisClient.RDB())
 			r.Delete("/auth/token", revokeTokenHandler(dl, log))
 		}
 
-		// Workspace creation and listing (no workspace context needed)
+		// Workspace create + list (no workspace context)
 		if wsCreateH != nil {
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
-			r.Post("/workspaces", wsH.Create)
-			r.Get("/workspaces", wsH.List)
+			// Creating a workspace: rate limit as a write operation.
+			r.With(rlWrite).Post("/workspaces", wsH.Create)
+			r.With(rlRead).Get("/workspaces", wsH.List)
 		}
 
-		// Workspace-scoped routes — WorkspaceAuth enforces membership
+		// Workspace-scoped routes
 		r.Route("/workspaces/{workspaceID}", func(r chi.Router) {
 			if wsRepo != nil {
 				r.Use(httpmiddleware.WorkspaceAuth(wsRepo))
 			}
 
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
-			r.Get("/", wsH.Get)
 
-			r.With(httpmiddleware.RequireAction(domainworkspace.ActionManageMembers)).
-				Post("/members", wsH.AddMember)
-			r.Get("/members", wsH.ListMembers)
+			r.With(rlRead).Get("/", wsH.Get)
 
-			// URLs
+			r.With(rlWrite,
+				httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+			).Post("/members", wsH.AddMember)
+			r.With(rlRead).Get("/members", wsH.ListMembers)
+
+			// URL routes
 			r.Route("/urls", func(r chi.Router) {
 				if shortenUseCase != nil {
-					r.With(httpmiddleware.RequireAction(domainworkspace.ActionCreateURL)).
-						Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+					r.With(rlWrite,
+						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
+					).Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 				}
 			})
 
-			// API keys
+			// API key routes
 			if keyCreateH != nil {
 				keyH := handler.NewAPIKeyHandler(keyCreateH, keyRevokeH, keyListH, log)
-				r.Get("/api-keys", keyH.List)
-				// Creating and revoking keys requires admin/owner
-				r.With(httpmiddleware.RequireAction(domainworkspace.ActionManageMembers)).
-					Post("/api-keys", keyH.Create)
-				r.With(httpmiddleware.RequireAction(domainworkspace.ActionManageMembers)).
-					Delete("/api-keys/{keyID}", keyH.Revoke)
+				r.With(rlRead).Get("/api-keys", keyH.List)
+				r.With(rlWrite,
+					httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				).Post("/api-keys", keyH.Create)
+				r.With(rlWrite,
+					httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				).Delete("/api-keys/{keyID}", keyH.Revoke)
 			}
 		})
 
 		// Legacy route — backwards compat
 		if shortenUseCase != nil {
-			r.Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+			r.With(rlWrite).Post("/urls",
+				handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 		}
 	})
 
@@ -291,7 +337,6 @@ func main() {
 	}
 
 	statsCancel()
-
 	shutdownCtx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)
 	defer cancel()
@@ -306,6 +351,18 @@ func main() {
 	}
 	_ = otelShutdown(shutdownCtx)
 	log.Info("shutdown complete")
+}
+
+// noopLimiter always allows requests. Used when Redis is unavailable.
+type noopLimiter struct{}
+
+func (n *noopLimiter) Check(_ context.Context, _ string, policy ratelimit.Policy) (*ratelimit.Result, error) {
+	return &ratelimit.Result{
+		Allowed:   true,
+		Remaining: policy.BucketCapacity(),
+		Limit:     policy.BucketCapacity(),
+		ResetAt:   time.Now().Add(policy.Window),
+	}, nil
 }
 
 func revokeTokenHandler(dl *infraauth.DenyList, log *slog.Logger) http.HandlerFunc {
