@@ -15,8 +15,8 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/urlshortener/platform/internal/application/shorten"
+	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
 	"github.com/urlshortener/platform/internal/config"
-	domainauth "github.com/urlshortener/platform/internal/domain/auth"
 	infraauth "github.com/urlshortener/platform/internal/infrastructure/auth"
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
@@ -28,6 +28,9 @@ import (
 	"github.com/urlshortener/platform/pkg/logger"
 	"github.com/urlshortener/platform/pkg/shortcode"
 	"github.com/urlshortener/platform/pkg/telemetry"
+
+	domainauth "github.com/urlshortener/platform/internal/domain/auth"
+	domainworkspace "github.com/urlshortener/platform/internal/domain/workspace"
 )
 
 var (
@@ -37,14 +40,12 @@ var (
 )
 
 func main() {
-	// ── 1. Configuration ──────────────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// ── 2. Logger ─────────────────────────────────────────────────────────────
 	log := logger.New(cfg.LogLevel, cfg.LogFormat).With(
 		slog.String("service", cfg.ServiceName),
 		slog.String("version", version),
@@ -56,30 +57,24 @@ func main() {
 	log.Info("starting api-service",
 		slog.String("build_time", buildTime),
 		slog.String("port", cfg.APIPort),
-		slog.String("metrics_port", cfg.MetricsPort),
 	)
 
 	ctx := context.Background()
 
-	// ── 3. OpenTelemetry ──────────────────────────────────────────────────────
 	otelShutdown, err := telemetry.InitTracer(ctx, telemetry.Config{
-		Enabled:        cfg.OTelEnabled,
-		Exporter:       cfg.OTelExporter,
-		OTLPEndpoint:   cfg.OTelEndpoint,
-		ServiceName:    cfg.ServiceName,
-		ServiceVersion: version,
-		Environment:    cfg.Environment,
-		SampleRate:     cfg.OTelSampleRate,
+		Enabled: cfg.OTelEnabled, Exporter: cfg.OTelExporter,
+		OTLPEndpoint: cfg.OTelEndpoint, ServiceName: cfg.ServiceName,
+		ServiceVersion: version, Environment: cfg.Environment,
+		SampleRate: cfg.OTelSampleRate,
 	})
 	if err != nil {
 		log.Error("failed to initialize opentelemetry", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	// ── 4. Prometheus metrics ─────────────────────────────────────────────────
 	appMetrics := metrics.New(cfg.ServiceName, version, commit)
 
-	// ── 5. PostgreSQL ─────────────────────────────────────────────────────────
+	// ── PostgreSQL ────────────────────────────────────────────────────────────
 	var dbClient *postgres.Client
 	if cfg.DBPrimaryDSN != "" {
 		dbCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -89,12 +84,10 @@ func main() {
 			log.Error("failed to connect to postgresql", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
-		log.Info("postgresql connected", slog.Int("max_conns", int(cfg.DBMaxOpenConns)))
-	} else {
-		log.Warn("DB_PRIMARY_DSN not set — running without database")
+		log.Info("postgresql connected")
 	}
 
-	// ── 6. Redis ──────────────────────────────────────────────────────────────
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	var redisClient *redisinfra.Client
 	if cfg.RedisAddr != "" {
 		redisCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -104,64 +97,40 @@ func main() {
 			log.Error("failed to connect to redis", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
-		log.Info("redis connected", slog.String("addr", cfg.RedisAddr))
-	} else {
-		log.Warn("REDIS_ADDR not set — running without cache")
+		log.Info("redis connected")
 	}
 
-	// ── 7. JWT auth configuration ─────────────────────────────────────────────
-	// Load the public key for JWT verification.
-	// The deny list is wired to Redis if available.
-	//
-	// Auth is optional in development:
-	//   - If JWT_PUBLIC_KEY_PATH is empty → no auth middleware applied
-	//   - Handlers fall back to X-Workspace-ID / X-User-ID headers
-	//   - WARNING: never run in production without a public key path
+	// ── JWT auth configuration ─────────────────────────────────────────────────
 	var authCfg *httpmiddleware.AuthConfig
-
 	if cfg.JWTPublicKeyPath != "" {
 		keySet, err := jwtutil.LoadPublicKeyAsJWKSet(cfg.JWTPublicKeyPath)
 		if err != nil {
-			log.Error("failed to load JWT public key",
-				slog.String("path", cfg.JWTPublicKeyPath),
-				slog.String("error", err.Error()),
-			)
+			log.Error("failed to load JWT public key", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
-
 		ac := httpmiddleware.AuthConfig{
-			Issuer:   cfg.JWTIssuer,
-			Audience: cfg.JWTAudience,
-			KeySet:   keySet,
-			Log:      log,
+			Issuer: cfg.JWTIssuer, Audience: cfg.JWTAudience,
+			KeySet: keySet, Log: log,
 		}
-
-		// Wire deny list if Redis is available.
 		if redisClient != nil {
 			ac.DenyList = infraauth.NewDenyList(redisClient.RDB())
-			log.Info("jwt deny list enabled (redis-backed)")
-		} else {
-			log.Warn("jwt deny list disabled (redis not configured) — tokens cannot be revoked")
 		}
-
 		authCfg = &ac
-		log.Info("jwt authentication enabled",
-			slog.String("issuer", cfg.JWTIssuer),
-			slog.String("audience", cfg.JWTAudience),
-			slog.String("public_key", cfg.JWTPublicKeyPath),
-		)
+		log.Info("jwt authentication enabled")
 	} else {
-		log.Warn("JWT_PUBLIC_KEY_PATH not set — authentication DISABLED (development mode only)")
+		log.Warn("JWT_PUBLIC_KEY_PATH not set — authentication DISABLED")
 		if cfg.IsProduction() {
-			log.Error("JWT_PUBLIC_KEY_PATH is required in production")
 			os.Exit(1)
 		}
 	}
 
-	// ── 8. Infrastructure adapters ────────────────────────────────────────────
+	// ── Infrastructure adapters ───────────────────────────────────────────────
 	var urlRepo *postgres.URLRepository
+	var wsRepo *postgres.WorkspaceRepository
+
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
+		wsRepo = postgres.NewWorkspaceRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -169,8 +138,9 @@ func main() {
 		urlCache = redisinfra.NewURLCache(redisClient)
 	}
 
-	// ── 9. Application use case handlers ─────────────────────────────────────
+	// ── Application layer ─────────────────────────────────────────────────────
 	codeGenerator := shortcode.New(cfg.ShortCodeLength)
+
 	var shortenUseCase *shorten.Handler
 	if urlRepo != nil {
 		shortenUseCase = shorten.NewHandler(
@@ -179,10 +149,24 @@ func main() {
 		)
 	}
 
-	// ── 10. HTTP router ───────────────────────────────────────────────────────
+	var (
+		wsCreateHandler   *appworkspace.CreateHandler
+		wsGetHandler      *appworkspace.GetHandler
+		wsListHandler     *appworkspace.ListHandler
+		memberAddHandler  *appworkspace.AddMemberHandler
+		memberListHandler *appworkspace.ListMembersHandler
+	)
+	if wsRepo != nil {
+		wsCreateHandler = appworkspace.NewCreateHandler(wsRepo, log)
+		wsGetHandler = appworkspace.NewGetHandler(wsRepo, wsRepo)
+		wsListHandler = appworkspace.NewListHandler(wsRepo, wsRepo)
+		memberAddHandler = appworkspace.NewAddMemberHandler(wsRepo, wsRepo, log)
+		memberListHandler = appworkspace.NewListMembersHandler(wsRepo)
+	}
+
+	// ── HTTP router ───────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Global middleware — applied to ALL routes including health probes.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(httpmiddleware.OTel(cfg.ServiceName))
@@ -191,55 +175,94 @@ func main() {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(time.Duration(cfg.APIWriteTimeoutS) * time.Second))
 
-	// Health probes — NO auth required.
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "alive"})
 	})
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
-	// API routes — auth middleware applied to this sub-router only.
+	// ── /api/v1 — authenticated routes ───────────────────────────────────────
 	r.Route("/api/v1", func(r chi.Router) {
-		// Apply JWT auth if configured.
-		// When authCfg is nil (dev mode without keys), no auth middleware runs
-		// and handlers use header-based identity fallback.
+		// JWT authentication gate
 		if authCfg != nil {
 			r.Use(httpmiddleware.Authenticate(*authCfg))
 		}
 
-		// POST /api/v1/urls — requires "write" scope
-		if shortenUseCase != nil {
-			r.With(httpmiddleware.RequireScope("write")).
-				Post("/urls",
-					handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
-		} else {
-			r.Post("/urls", func(w http.ResponseWriter, r *http.Request) {
-				response.WriteProblem(w, response.Problem{
-					Type:   response.ProblemTypeInternal,
-					Title:  "Service Unavailable",
-					Status: http.StatusServiceUnavailable,
-					Detail: "Database not available. Run: make infra-up",
-				})
-			})
-		}
-
-		// Token revocation endpoint.
-		// DELETE /api/v1/auth/token — add current token to deny list (logout).
-		// Requires a valid token (auth middleware) to revoke itself.
+		// Token revocation (logout) — auth only, no workspace context needed
 		if authCfg != nil && redisClient != nil {
-			denyList := infraauth.NewDenyList(redisClient.RDB())
-			r.Delete("/auth/token", revokeTokenHandler(denyList, log))
+			dl := infraauth.NewDenyList(redisClient.RDB())
+			r.Delete("/auth/token", revokeTokenHandler(dl, log))
 		}
 
-		// TODO(story-2.2): GET/PATCH/DELETE /urls/{id} — workspace-scoped CRUD
-		// TODO(story-2.2): POST /workspaces, GET /workspaces/{id}/members
+		// ── Workspace management ──────────────────────────────────────────────
+		// POST /workspaces — create a workspace (no workspace context needed,
+		//   the user is creating a new one)
+		if wsCreateHandler != nil {
+			r.Post("/workspaces", handler.NewWorkspaceHandler(
+				wsCreateHandler, wsGetHandler, wsListHandler,
+				memberAddHandler, memberListHandler, log,
+			).Create)
+		}
+
+		// GET /workspaces — list workspaces for the current user
+		if wsListHandler != nil {
+			r.Get("/workspaces", handler.NewWorkspaceHandler(
+				wsCreateHandler, wsGetHandler, wsListHandler,
+				memberAddHandler, memberListHandler, log,
+			).List)
+		}
+
+		// ── Workspace-scoped routes: WorkspaceAuth verifies membership ────────
+		// All routes under /workspaces/{workspaceID} require the caller to be
+		// a member of the specified workspace. WorkspaceAuth enforces this and
+		// stores the Member (with role) in context for downstream handlers.
+		r.Route("/workspaces/{workspaceID}", func(r chi.Router) {
+			if wsRepo != nil {
+				r.Use(httpmiddleware.WorkspaceAuth(wsRepo))
+			}
+
+			wsHandler := handler.NewWorkspaceHandler(
+				wsCreateHandler, wsGetHandler, wsListHandler,
+				memberAddHandler, memberListHandler, log,
+			)
+
+			// GET /workspaces/{workspaceID} — any member role
+			r.Get("/", wsHandler.Get)
+
+			// POST /workspaces/{workspaceID}/members — requires ManageMembers
+			r.With(
+				httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+			).Post("/members", wsHandler.AddMember)
+
+			// GET /workspaces/{workspaceID}/members — any member role
+			r.Get("/members", wsHandler.ListMembers)
+
+			// ── URL routes scoped to workspace ────────────────────────────────
+			r.Route("/urls", func(r chi.Router) {
+				// POST — requires write permission (editor, admin, owner)
+				if shortenUseCase != nil {
+					r.With(
+						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
+					).Post("/",
+						handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+				}
+				// TODO(story-2.6): GET /, GET /{id}, PATCH /{id}, DELETE /{id}
+			})
+		})
+
+		// Legacy /urls route (backwards compat during Phase 1 → Phase 2 migration)
+		// Will be removed once all clients use /workspaces/{id}/urls
+		if shortenUseCase != nil {
+			r.Post("/urls",
+				handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+		}
 	})
 
-	// ── 11. Metrics server ────────────────────────────────────────────────────
+	// ── Metrics server ────────────────────────────────────────────────────────
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", appMetrics.Handler())
 	metricsSrv := &http.Server{Addr: ":" + cfg.MetricsPort, Handler: metricsMux}
 
-	// ── 12. Application server ────────────────────────────────────────────────
+	// ── Application server ────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         ":" + cfg.APIPort,
 		Handler:      r,
@@ -262,14 +285,11 @@ func main() {
 		}
 	}()
 
-	// Pool stats background collector.
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	go collectPoolStats(statsCtx, appMetrics, dbClient, redisClient)
 
-	// ── 13. Graceful shutdown ─────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
 	select {
 	case err := <-serverErr:
 		log.Error("server error", slog.String("error", err.Error()))
@@ -279,62 +299,38 @@ func main() {
 
 	statsCancel()
 
-	shutdownCtx, cancel := context.WithTimeout(
-		context.Background(),
-		time.Duration(cfg.APIShutdownTimeoutS)*time.Second,
-	)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Error("http shutdown error", slog.String("error", err.Error()))
-	}
-	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
-		log.Error("metrics shutdown error", slog.String("error", err.Error()))
-	}
+	_ = srv.Shutdown(shutdownCtx)
+	_ = metricsSrv.Shutdown(shutdownCtx)
 	if redisClient != nil {
 		_ = redisClient.Close()
 	}
 	if dbClient != nil {
 		dbClient.Close()
 	}
-	if err := otelShutdown(shutdownCtx); err != nil {
-		log.Error("otel shutdown error", slog.String("error", err.Error()))
-	}
-
+	_ = otelShutdown(shutdownCtx)
 	log.Info("shutdown complete")
 }
 
-// revokeTokenHandler handles DELETE /api/v1/auth/token.
-// Adds the caller's JTI to the deny list (logout / token revocation).
-// The auth middleware has already validated the token, so claims are
-// always present by the time this handler runs.
 func revokeTokenHandler(dl *infraauth.DenyList, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := domainauth.FromContext(r.Context())
 		if !ok {
 			response.WriteProblem(w, response.Problem{
-				Type:   response.ProblemTypeUnauthenticated,
-				Title:  "Unauthorized",
+				Type: response.ProblemTypeUnauthenticated, Title: "Unauthorized",
 				Status: http.StatusUnauthorized,
-				Detail: "No authentication claims found.",
 			})
 			return
 		}
-
 		if err := dl.Revoke(r.Context(), claims.TokenID, claims.ExpiresAt); err != nil {
-			log.Error("failed to revoke token",
-				slog.String("jti", claims.TokenID),
-				slog.String("error", err.Error()),
-			)
+			log.Error("failed to revoke token", slog.String("error", err.Error()))
 			response.InternalError(w, r.URL.Path)
 			return
 		}
-
-		log.Info("token revoked",
-			slog.String("user_id", claims.UserID),
-			slog.String("jti", claims.TokenID),
-		)
-
+		log.Info("token revoked", slog.String("jti", claims.TokenID))
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -343,7 +339,6 @@ func readyHandler(log *slog.Logger, db *postgres.Client, cache *redisinfra.Clien
 	return func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-
 		if db == nil {
 			response.WriteProblem(w, response.Problem{
 				Type: response.ProblemTypeInternal, Title: "Not Ready",
@@ -352,27 +347,22 @@ func readyHandler(log *slog.Logger, db *postgres.Client, cache *redisinfra.Clien
 			return
 		}
 		if err := db.Ping(pingCtx); err != nil {
-			log.Warn("readiness: postgresql ping failed", slog.String("error", err.Error()))
+			log.Warn("readiness: db ping failed")
 			response.WriteProblem(w, response.Problem{
 				Type: response.ProblemTypeInternal, Title: "Not Ready",
 				Status: http.StatusServiceUnavailable, Detail: "database unreachable",
 			})
 			return
 		}
-		if cache == nil {
-			response.WriteProblem(w, response.Problem{
-				Type: response.ProblemTypeInternal, Title: "Not Ready",
-				Status: http.StatusServiceUnavailable, Detail: "cache not configured",
-			})
-			return
-		}
-		if err := cache.Ping(pingCtx); err != nil {
-			log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
-			response.WriteProblem(w, response.Problem{
-				Type: response.ProblemTypeInternal, Title: "Not Ready",
-				Status: http.StatusServiceUnavailable, Detail: "cache unreachable",
-			})
-			return
+		if cache != nil {
+			if err := cache.Ping(pingCtx); err != nil {
+				log.Warn("readiness: redis ping failed")
+				response.WriteProblem(w, response.Problem{
+					Type: response.ProblemTypeInternal, Title: "Not Ready",
+					Status: http.StatusServiceUnavailable, Detail: "cache unreachable",
+				})
+				return
+			}
 		}
 		response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	}

@@ -13,12 +13,14 @@ package postgres_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 
 	"github.com/urlshortener/platform/internal/config"
+	domainworkspace "github.com/urlshortener/platform/internal/domain/workspace"
 	"github.com/urlshortener/platform/internal/domain/url"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
 )
@@ -27,6 +29,10 @@ import (
 // Uses DB_PRIMARY_DSN from environment (set via .env or CI service).
 func testClient(t *testing.T) *postgres.Client {
 	t.Helper()
+
+	if err := config.LoadDotEnv(); err != nil {
+		t.Fatalf("failed to load .env for integration tests: %v", err)
+	}
 
 	dsn := os.Getenv("DB_PRIMARY_DSN")
 	if dsn == "" {
@@ -79,10 +85,44 @@ func newTestURL(workspaceID string) *url.URL {
 	}
 }
 
+func createWorkspaceFixture(t *testing.T, ctx context.Context, client *postgres.Client, workspaceID string) {
+	t.Helper()
+
+	repo := postgres.NewWorkspaceRepository(client)
+	ownerID := ulid.Make().String()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	slugSuffix := strings.ToLower(workspaceID)
+	if len(slugSuffix) > 12 {
+		slugSuffix = slugSuffix[:12]
+	}
+
+	w := &domainworkspace.Workspace{
+		ID:        workspaceID,
+		Name:      "Test Workspace " + slugSuffix,
+		Slug:      "test-" + slugSuffix,
+		PlanTier:  "free",
+		OwnerID:   ownerID,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	m := &domainworkspace.Member{
+		WorkspaceID: workspaceID,
+		UserID:      ownerID,
+		Role:        domainworkspace.RoleOwner,
+		JoinedAt:    now,
+	}
+
+	if err := repo.Create(ctx, w, m); err != nil {
+		t.Fatalf("failed to create workspace fixture: %v", err)
+	}
+}
+
 func TestURLRepository_Create_And_GetByShortCode(t *testing.T) {
-	repo := testRepo(t)
+	client := testClient(t)
+	repo := postgres.NewURLRepository(client)
 	ctx := context.Background()
 	workspaceID := ulid.Make().String()
+	createWorkspaceFixture(t, ctx, client, workspaceID)
 
 	u := newTestURL(workspaceID)
 
@@ -107,9 +147,11 @@ func TestURLRepository_Create_And_GetByShortCode(t *testing.T) {
 }
 
 func TestURLRepository_Create_DuplicateShortCode(t *testing.T) {
-	repo := testRepo(t)
+	client := testClient(t)
+	repo := postgres.NewURLRepository(client)
 	ctx := context.Background()
 	workspaceID := ulid.Make().String()
+	createWorkspaceFixture(t, ctx, client, workspaceID)
 
 	u := newTestURL(workspaceID)
 
@@ -138,9 +180,11 @@ func TestURLRepository_GetByShortCode_NotFound(t *testing.T) {
 }
 
 func TestURLRepository_SoftDelete(t *testing.T) {
-	repo := testRepo(t)
+	client := testClient(t)
+	repo := postgres.NewURLRepository(client)
 	ctx := context.Background()
 	workspaceID := ulid.Make().String()
+	createWorkspaceFixture(t, ctx, client, workspaceID)
 
 	u := newTestURL(workspaceID)
 	if err := repo.Create(ctx, u); err != nil {
@@ -159,9 +203,11 @@ func TestURLRepository_SoftDelete(t *testing.T) {
 }
 
 func TestURLRepository_SoftDelete_WrongWorkspace(t *testing.T) {
-	repo := testRepo(t)
+	client := testClient(t)
+	repo := postgres.NewURLRepository(client)
 	ctx := context.Background()
 	workspaceID := ulid.Make().String()
+	createWorkspaceFixture(t, ctx, client, workspaceID)
 
 	u := newTestURL(workspaceID)
 	if err := repo.Create(ctx, u); err != nil {
@@ -177,9 +223,11 @@ func TestURLRepository_SoftDelete_WrongWorkspace(t *testing.T) {
 }
 
 func TestURLRepository_IncrementClickCount(t *testing.T) {
-	repo := testRepo(t)
+	client := testClient(t)
+	repo := postgres.NewURLRepository(client)
 	ctx := context.Background()
 	workspaceID := ulid.Make().String()
+	createWorkspaceFixture(t, ctx, client, workspaceID)
 
 	u := newTestURL(workspaceID)
 	if err := repo.Create(ctx, u); err != nil {
@@ -199,9 +247,11 @@ func TestURLRepository_IncrementClickCount(t *testing.T) {
 }
 
 func TestURLRepository_List_CursorPagination(t *testing.T) {
-	repo := testRepo(t)
+	client := testClient(t)
+	repo := postgres.NewURLRepository(client)
 	ctx := context.Background()
 	workspaceID := ulid.Make().String()
+	createWorkspaceFixture(t, ctx, client, workspaceID)
 
 	// Insert 5 URLs.
 	for i := 0; i < 5; i++ {
