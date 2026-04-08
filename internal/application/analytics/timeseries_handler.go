@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/urlshortener/platform/internal/application/apperrors"
 	"github.com/urlshortener/platform/internal/domain/analytics"
@@ -56,8 +57,10 @@ func NewTimeSeriesHandler(ar QueryRepository, ur URLReadRepository) *TimeSeriesH
 // Handle executes the GetAnalyticsTimeSeries use case.
 func (h *TimeSeriesHandler) Handle(ctx context.Context, q TimeSeriesQuery) (*TimeSeriesResult, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "GetAnalyticsTimeSeries.Handle",
-		attribute.String("url.id", q.URLID),
-		attribute.String("analytics.granularity", string(q.Granularity)),
+		trace.WithAttributes(
+			attribute.String("url.id", q.URLID),
+			attribute.String("analytics.granularity", string(q.Granularity)),
+		),
 	)
 	defer span.End()
 

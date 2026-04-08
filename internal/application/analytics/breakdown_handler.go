@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/urlshortener/platform/internal/application/apperrors"
 	"github.com/urlshortener/platform/internal/domain/analytics"
@@ -52,8 +53,10 @@ func NewBreakdownHandler(ar QueryRepository, ur URLReadRepository) *BreakdownHan
 // Handle executes the GetAnalyticsBreakdown use case.
 func (h *BreakdownHandler) Handle(ctx context.Context, q BreakdownQuery) (*BreakdownResult, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "GetAnalyticsBreakdown.Handle",
-		attribute.String("url.id", q.URLID),
-		attribute.String("analytics.dimension", string(q.Dimension)),
+		trace.WithAttributes(
+			attribute.String("url.id", q.URLID),
+			attribute.String("analytics.dimension", string(q.Dimension)),
+		),
 	)
 	defer span.End()
 

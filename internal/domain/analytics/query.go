@@ -1,16 +1,4 @@
 // Package analytics defines the domain model for analytics query operations.
-//
-// This package owns the vocabulary of analytics queries — what time windows
-// are valid, what granularities are supported, what dimensions can be broken
-// down. The query constraints here map directly to PRD section 5.4.
-//
-// Separation from the ingestion domain (event.go in Story 3.1):
-//
-//	Ingestion is a write concern — optimised for throughput, buffered, async.
-//	Querying is a read concern — optimised for latency, uses the read replica,
-//	benefits from pre-computed recording rules in Prometheus for dashboards.
-//	Keeping them in separate files prevents write-path types from leaking
-//	into read-path handlers and vice versa.
 package analytics
 
 import (
@@ -18,10 +6,7 @@ import (
 	"time"
 )
 
-// ── Time windows ──────────────────────────────────────────────────────────────
-
 // Window represents a named time window for analytics aggregation.
-// Named windows map to concrete durations and are used by the summary endpoint.
 type Window string
 
 const (
@@ -32,8 +17,8 @@ const (
 	WindowAllTime Window = "all"
 )
 
-// Duration returns the time.Duration for a named window.
-// WindowAllTime returns 0 (caller interprets as unbounded).
+// Duration returns the concrete duration for a named window.
+// WindowAllTime returns 0 and is handled by callers as unbounded.
 func (w Window) Duration() time.Duration {
 	switch w {
 	case Window1Hour:
@@ -49,17 +34,17 @@ func (w Window) Duration() time.Duration {
 	}
 }
 
-// IsValid returns true for recognised window values.
+// IsValid returns true for recognized window values.
 func (w Window) IsValid() bool {
 	switch w {
 	case Window1Hour, Window24Hour, Window7Day, Window30Day, WindowAllTime:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
-// ParseWindow converts a string to a Window, returning an error for
-// unrecognised values. Used by HTTP handlers to parse query parameters.
+// ParseWindow converts a string to a Window.
 func ParseWindow(s string) (Window, error) {
 	w := Window(s)
 	if !w.IsValid() {
@@ -68,14 +53,7 @@ func ParseWindow(s string) (Window, error) {
 	return w, nil
 }
 
-// ── Granularity ───────────────────────────────────────────────────────────────
-
 // Granularity controls the bucket size for time-series queries.
-// PRD section 5.4.2 defines the valid combinations:
-//
-//	1-minute buckets: max 24h window
-//	1-hour buckets:   max 30d window
-//	1-day buckets:    max 365d window
 type Granularity string
 
 const (
@@ -84,13 +62,14 @@ const (
 	Granularity1Day    Granularity = "1d"
 )
 
-// IsValid returns true for recognised granularity values.
+// IsValid returns true for recognized granularity values.
 func (g Granularity) IsValid() bool {
 	switch g {
 	case Granularity1Minute, Granularity1Hour, Granularity1Day:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // ParseGranularity converts a string to a Granularity.
@@ -102,8 +81,7 @@ func ParseGranularity(s string) (Granularity, error) {
 	return g, nil
 }
 
-// ValidateWindowGranularity enforces PRD section 5.4.2 compatibility rules.
-// Returns an error if the window is too wide for the requested granularity.
+// ValidateWindowGranularity ensures the requested bucket size fits the time span.
 func ValidateWindowGranularity(start, end time.Time, g Granularity) error {
 	span := end.Sub(start)
 	switch g {
@@ -123,8 +101,6 @@ func ValidateWindowGranularity(start, end time.Time, g Granularity) error {
 	return nil
 }
 
-// ── Dimension ─────────────────────────────────────────────────────────────────
-
 // Dimension is a categorical field for breakdown queries.
 type Dimension string
 
@@ -136,19 +112,17 @@ const (
 	DimensionReferrer   Dimension = "referrer_domain"
 )
 
-// IsValid returns true for recognised dimension values.
+// IsValid returns true for recognized dimension values.
 func (d Dimension) IsValid() bool {
 	switch d {
-	case DimensionCountry, DimensionDeviceType, DimensionBrowser,
-		DimensionOS, DimensionReferrer:
+	case DimensionCountry, DimensionDeviceType, DimensionBrowser, DimensionOS, DimensionReferrer:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // ColumnName returns the database column name for this dimension.
-// Used to safely construct GROUP BY clauses — dimension values are
-// validated before use, preventing SQL injection via dimension names.
 func (d Dimension) ColumnName() string {
 	switch d {
 	case DimensionCountry:
@@ -175,31 +149,24 @@ func ParseDimension(s string) (Dimension, error) {
 	return d, nil
 }
 
-// ── Result types ──────────────────────────────────────────────────────────────
-
 // Summary is the aggregate click count for a URL over a time window.
-// Returned by GET /api/v1/workspaces/{id}/urls/{urlID}/analytics
 type Summary struct {
 	ShortCode   string
 	TotalClicks int64
-	UniqueIPs   int64 // approximate (COUNT DISTINCT on hashed IP)
+	UniqueIPs   int64
 	WindowStart time.Time
 	WindowEnd   time.Time
-	// BotClicks is the count of requests identified as bot traffic.
-	// Excluded from TotalClicks by default (is_bot = false filter).
-	BotClicks int64
+	BotClicks   int64
 }
 
 // TimeSeriesPoint is a single time bucket with its click count.
 type TimeSeriesPoint struct {
-	// BucketStart is the start of the time bucket (UTC).
 	BucketStart time.Time
 	Clicks      int64
 	UniqueIPs   int64
 }
 
 // TimeSeries is the ordered sequence of time buckets for a URL.
-// Returned by GET /api/v1/workspaces/{id}/urls/{urlID}/analytics/timeseries
 type TimeSeries struct {
 	ShortCode   string
 	Granularity Granularity
@@ -210,16 +177,12 @@ type TimeSeries struct {
 
 // DimensionCount is a single dimension value with its click count.
 type DimensionCount struct {
-	// Value is the dimension value (e.g. "US", "mobile", "Chrome").
-	// Empty string represents unclassified/unknown.
-	Value  string
-	Clicks int64
-	// Percentage is Clicks / TotalClicks * 100, computed at the query layer.
+	Value      string
+	Clicks     int64
 	Percentage float64
 }
 
 // Breakdown is the dimensional distribution of clicks for a URL.
-// Returned by GET /api/v1/workspaces/{id}/urls/{urlID}/analytics/breakdown
 type Breakdown struct {
 	ShortCode   string
 	Dimension   Dimension

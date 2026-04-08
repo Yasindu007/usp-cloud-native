@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/urlshortener/platform/internal/domain/analytics"
 )
@@ -52,7 +53,7 @@ func (r *AnalyticsQueryRepository) GetSummary(
 	start, end time.Time,
 ) (*analytics.Summary, error) {
 	ctx, span := otel.Tracer(analyticsQueryTracerName).Start(ctx, "AnalyticsQuery.GetSummary",
-		attribute.String("url.short_code", shortCode),
+		trace.WithAttributes(attribute.String("url.short_code", shortCode)),
 	)
 	defer span.End()
 
@@ -104,8 +105,10 @@ func (r *AnalyticsQueryRepository) GetTimeSeries(
 	granularity analytics.Granularity,
 ) (*analytics.TimeSeries, error) {
 	ctx, span := otel.Tracer(analyticsQueryTracerName).Start(ctx, "AnalyticsQuery.GetTimeSeries",
-		attribute.String("url.short_code", shortCode),
-		attribute.String("analytics.granularity", string(granularity)),
+		trace.WithAttributes(
+			attribute.String("url.short_code", shortCode),
+			attribute.String("analytics.granularity", string(granularity)),
+		),
 	)
 	defer span.End()
 
@@ -194,8 +197,10 @@ func (r *AnalyticsQueryRepository) GetBreakdown(
 	dim analytics.Dimension,
 ) (*analytics.Breakdown, error) {
 	ctx, span := otel.Tracer(analyticsQueryTracerName).Start(ctx, "AnalyticsQuery.GetBreakdown",
-		attribute.String("url.short_code", shortCode),
-		attribute.String("analytics.dimension", string(dim)),
+		trace.WithAttributes(
+			attribute.String("url.short_code", shortCode),
+			attribute.String("analytics.dimension", string(dim)),
+		),
 	)
 	defer span.End()
 

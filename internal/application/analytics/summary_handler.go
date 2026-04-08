@@ -9,6 +9,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/urlshortener/platform/internal/application/apperrors"
 	"github.com/urlshortener/platform/internal/domain/analytics"
@@ -73,8 +74,10 @@ func NewSummaryHandler(ar QueryRepository, ur URLReadRepository, baseURL string)
 // Handle executes the GetAnalyticsSummary use case.
 func (h *SummaryHandler) Handle(ctx context.Context, q SummaryQuery) (*SummaryResult, error) {
 	ctx, span := otel.Tracer(tracerName).Start(ctx, "GetAnalyticsSummary.Handle",
-		attribute.String("url.id", q.URLID),
-		attribute.String("analytics.window", string(q.Window)),
+		trace.WithAttributes(
+			attribute.String("url.id", q.URLID),
+			attribute.String("analytics.window", string(q.Window)),
+		),
 	)
 	defer span.End()
 
