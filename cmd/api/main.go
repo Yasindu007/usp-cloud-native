@@ -17,6 +17,7 @@ import (
 	appkey "github.com/urlshortener/platform/internal/application/apikey"
 	appaudit "github.com/urlshortener/platform/internal/application/audit"
 	"github.com/urlshortener/platform/internal/application/shorten"
+	appurl "github.com/urlshortener/platform/internal/application/url"
 	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
 	"github.com/urlshortener/platform/internal/config"
 	infraauth "github.com/urlshortener/platform/internal/infrastructure/auth"
@@ -149,28 +150,31 @@ func main() {
 	}
 
 	// ── Audit service ─────────────────────────────────────────────────────────
-	// The audit service starts its background goroutine here.
-	// It runs until the application context is cancelled.
-	// We use a separate context so we can control shutdown order:
-	// Stop accepting HTTP first, then flush audit events.
 	auditCtx, auditCancel := context.WithCancel(ctx)
 	var auditSvc *appaudit.Service
 	if auditRepo != nil {
 		auditSvc = appaudit.NewService(auditCtx, auditRepo, log)
 		log.Info("audit service started")
-	} else {
-		log.Warn("audit service disabled — database not configured")
 	}
 
 	// ── Application layer ─────────────────────────────────────────────────────
 	codeGenerator := shortcode.New(cfg.ShortCodeLength)
 
 	var shortenUseCase *shorten.Handler
+	var urlGetH *appurl.GetHandler
+	var urlListH *appurl.ListHandler
+	var urlUpdateH *appurl.UpdateHandler
+	var urlDeleteH *appurl.DeleteHandler
+
 	if urlRepo != nil {
 		shortenUseCase = shorten.NewHandler(
 			urlRepo, urlCache, codeGenerator,
 			cfg.BaseURL, cfg.RedirectCacheTTLS, log,
 		)
+		urlGetH = appurl.NewGetHandler(urlRepo, cfg.BaseURL)
+		urlListH = appurl.NewListHandler(urlRepo, cfg.BaseURL)
+		urlUpdateH = appurl.NewUpdateHandler(urlRepo, urlCache, cfg.BaseURL, log)
+		urlDeleteH = appurl.NewDeleteHandler(urlRepo, urlCache, log)
 	}
 
 	var (
@@ -196,7 +200,7 @@ func main() {
 		keyListH = appkey.NewListHandler(keyRepo, wsRepo)
 	}
 
-	// ── Rate limit middleware ─────────────────────────────────────────────────
+	// ── Middleware factories ───────────────────────────────────────────────────
 	var effectiveLimiter httpmiddleware.Limiter
 	if tokenBucketLimiter != nil {
 		effectiveLimiter = tokenBucketLimiter
@@ -213,9 +217,6 @@ func main() {
 		EndpointClass: ratelimit.ClassWrite, Log: log, FailOpen: true,
 	})
 
-	// ── Audit middleware factory ───────────────────────────────────────────────
-	// auditOf wraps a handler with audit capture for a specific action.
-	// Returns a no-op middleware when audit service is nil.
 	auditOf := func(action domainaudit.Action) func(http.Handler) http.Handler {
 		if auditSvc == nil {
 			return func(next http.Handler) http.Handler { return next }
@@ -240,7 +241,7 @@ func main() {
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// Authentication
+		// ── Dual authentication ───────────────────────────────────────────────
 		if keyRepo != nil {
 			r.Use(httpmiddleware.APIKeyAuth(keyRepo, log))
 		}
@@ -255,7 +256,7 @@ func main() {
 				Delete("/auth/token", revokeTokenHandler(dl, log))
 		}
 
-		// Workspace create/list
+		// Workspace create/list (no workspace context needed)
 		if wsCreateH != nil {
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
 			r.With(rlWrite, auditOf(domainaudit.ActionWorkspaceCreate)).
@@ -271,35 +272,78 @@ func main() {
 
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
 			r.With(rlRead).Get("/", wsH.Get)
-			r.With(rlWrite, httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+
+			r.With(rlWrite,
+				httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
 				auditOf(domainaudit.ActionMemberAdd),
 			).Post("/members", wsH.AddMember)
 			r.With(rlRead).Get("/members", wsH.ListMembers)
 
-			// URLs
+			// ── URL CRUD ──────────────────────────────────────────────────────
+			// This is the complete URL resource endpoint set, wired with:
+			//   - Workspace-scoped auth (WorkspaceAuth already applied above)
+			//   - Role-based action enforcement (RequireAction)
+			//   - Rate limiting per endpoint class
+			//   - Audit logging per mutating operation
 			r.Route("/urls", func(r chi.Router) {
+				urlH := handler.NewURLHandler(urlGetH, urlListH, urlUpdateH, urlDeleteH, log)
+
+				// POST /urls — create (shorten)
 				if shortenUseCase != nil {
 					r.With(rlWrite,
 						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
 						auditOf(domainaudit.ActionURLCreate),
-					).Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+					).Post("/",
+						handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+				}
+
+				// GET /urls — list with pagination + filtering
+				if urlListH != nil {
+					r.With(rlRead,
+						httpmiddleware.RequireAction(domainworkspace.ActionViewURL),
+					).Get("/", urlH.List)
+				}
+
+				// GET /urls/{urlID} — get single URL
+				if urlGetH != nil {
+					r.With(rlRead,
+						httpmiddleware.RequireAction(domainworkspace.ActionViewURL),
+					).Get("/{urlID}", urlH.Get)
+				}
+
+				// PATCH /urls/{urlID} — partial update
+				if urlUpdateH != nil {
+					r.With(rlWrite,
+						httpmiddleware.RequireAction(domainworkspace.ActionUpdateURL),
+						auditOf(domainaudit.ActionURLUpdate),
+					).Patch("/{urlID}", urlH.Update)
+				}
+
+				// DELETE /urls/{urlID} — soft delete
+				if urlDeleteH != nil {
+					r.With(rlWrite,
+						httpmiddleware.RequireAction(domainworkspace.ActionDeleteURL),
+						auditOf(domainaudit.ActionURLDelete),
+					).Delete("/{urlID}", urlH.Delete)
 				}
 			})
 
-			// API keys
+			// API key management
 			if keyCreateH != nil {
 				keyH := handler.NewAPIKeyHandler(keyCreateH, keyRevokeH, keyListH, log)
 				r.With(rlRead).Get("/api-keys", keyH.List)
-				r.With(rlWrite, httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				r.With(rlWrite,
+					httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
 					auditOf(domainaudit.ActionAPIKeyCreate),
 				).Post("/api-keys", keyH.Create)
-				r.With(rlWrite, httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
+				r.With(rlWrite,
+					httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
 					auditOf(domainaudit.ActionAPIKeyRevoke),
 				).Delete("/api-keys/{keyID}", keyH.Revoke)
 			}
 		})
 
-		// Legacy route
+		// Legacy /urls route — maintained for backwards compatibility
 		if shortenUseCase != nil {
 			r.With(rlWrite, auditOf(domainaudit.ActionURLCreate)).
 				Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
@@ -346,13 +390,6 @@ func main() {
 
 	statsCancel()
 
-	// ── Ordered shutdown ──────────────────────────────────────────────────────
-	// 1. Stop HTTP servers (no new requests)
-	// 2. Cancel audit goroutine context
-	// 3. Flush remaining audit events (Shutdown drains the channel)
-	// 4. Close DB and Redis connections
-	// 5. Flush OTel spans
-
 	shutdownCtx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)
 	defer cancel()
@@ -363,7 +400,7 @@ func main() {
 
 	if auditSvc != nil {
 		log.Info("flushing audit events")
-		auditCancel() // stop drainer goroutine
+		auditCancel()
 		auditSvc.Shutdown(shutdownCtx)
 	}
 
@@ -373,13 +410,12 @@ func main() {
 	if dbClient != nil {
 		dbClient.Close()
 	}
-
-	log.Info("flushing telemetry spans")
 	_ = otelShutdown(shutdownCtx)
 	log.Info("shutdown complete")
 }
 
-// noopLimiter allows all requests (used when Redis unavailable).
+// ── Supporting handlers and helpers ───────────────────────────────────────────
+
 type noopLimiter struct{}
 
 func (n *noopLimiter) Check(_ context.Context, _ string, policy ratelimit.Policy) (*ratelimit.Result, error) {
@@ -406,12 +442,8 @@ func revokeTokenHandler(dl *infraauth.DenyList, log *slog.Logger) http.HandlerFu
 			response.InternalError(w, r.URL.Path)
 			return
 		}
-		// Annotation happens here — this is a direct handler, not using the
-		// standard handler pattern, so we annotate inline.
-		domainaudit.AnnotateContext(r.Context(),
-			domainaudit.ResourceToken, claims.TokenID,
-			map[string]any{"revoked_by": claims.UserID},
-		)
+		domainaudit.AnnotateContext(r.Context(), domainaudit.ResourceToken,
+			claims.TokenID, map[string]any{"revoked_by": claims.UserID})
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
