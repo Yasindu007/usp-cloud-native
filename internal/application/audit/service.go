@@ -221,8 +221,7 @@ func (s *Service) runDrainer(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Context cancelled (application shutting down).
-			// Final flush is handled by Shutdown() — do not double-write here.
+			flush()
 			return
 
 		case evt := <-s.channel:

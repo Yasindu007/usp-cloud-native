@@ -48,6 +48,10 @@ type Result struct {
 	// ShortCode is echoed back for logging and analytics.
 	ShortCode string
 
+	// WorkspaceID is used by analytics capture to attribute redirect traffic
+	// to the owning workspace.
+	WorkspaceID string
+
 	// CacheStatus indicates whether this resolution was served from cache.
 	// Values: "hit" | "miss" | "negative_hit"
 	// Used to populate the cache_hit_ratio SLI metric.

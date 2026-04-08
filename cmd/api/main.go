@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	appanalytics "github.com/urlshortener/platform/internal/application/analytics"
 	appkey "github.com/urlshortener/platform/internal/application/apikey"
 	appaudit "github.com/urlshortener/platform/internal/application/audit"
 	"github.com/urlshortener/platform/internal/application/shorten"
@@ -100,14 +101,11 @@ func main() {
 		log.Info("redis connected")
 	}
 
-	// ── Rate limiter ──────────────────────────────────────────────────────────
 	var tokenBucketLimiter *redisinfra.TokenBucketLimiter
 	if redisClient != nil {
 		tokenBucketLimiter = redisinfra.NewTokenBucketLimiter(redisClient)
-		log.Info("rate limiter enabled")
 	}
 
-	// ── JWT auth ──────────────────────────────────────────────────────────────
 	var authCfg *httpmiddleware.AuthConfig
 	if cfg.JWTPublicKeyPath != "" {
 		keySet, err := jwtutil.LoadPublicKeyAsJWKSet(cfg.JWTPublicKeyPath)
@@ -136,12 +134,14 @@ func main() {
 	var wsRepo *postgres.WorkspaceRepository
 	var keyRepo *postgres.APIKeyRepository
 	var auditRepo *postgres.AuditRepository
+	var analyticsQueryRepo *postgres.AnalyticsQueryRepository
 
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
 		wsRepo = postgres.NewWorkspaceRepository(dbClient)
 		keyRepo = postgres.NewAPIKeyRepository(dbClient)
 		auditRepo = postgres.NewAuditRepository(dbClient)
+		analyticsQueryRepo = postgres.NewAnalyticsQueryRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -166,6 +166,11 @@ func main() {
 	var urlUpdateH *appurl.UpdateHandler
 	var urlDeleteH *appurl.DeleteHandler
 
+	// Analytics use cases
+	var analyticsSummaryH *appanalytics.SummaryHandler
+	var analyticsTimeSeriesH *appanalytics.TimeSeriesHandler
+	var analyticsBreakdownH *appanalytics.BreakdownHandler
+
 	if urlRepo != nil {
 		shortenUseCase = shorten.NewHandler(
 			urlRepo, urlCache, codeGenerator,
@@ -175,6 +180,13 @@ func main() {
 		urlListH = appurl.NewListHandler(urlRepo, cfg.BaseURL)
 		urlUpdateH = appurl.NewUpdateHandler(urlRepo, urlCache, cfg.BaseURL, log)
 		urlDeleteH = appurl.NewDeleteHandler(urlRepo, urlCache, log)
+	}
+
+	if analyticsQueryRepo != nil && urlRepo != nil {
+		analyticsSummaryH = appanalytics.NewSummaryHandler(analyticsQueryRepo, urlRepo, cfg.BaseURL)
+		analyticsTimeSeriesH = appanalytics.NewTimeSeriesHandler(analyticsQueryRepo, urlRepo)
+		analyticsBreakdownH = appanalytics.NewBreakdownHandler(analyticsQueryRepo, urlRepo)
+		log.Info("analytics query handlers enabled")
 	}
 
 	var (
@@ -200,7 +212,7 @@ func main() {
 		keyListH = appkey.NewListHandler(keyRepo, wsRepo)
 	}
 
-	// ── Middleware factories ───────────────────────────────────────────────────
+	// ── Middleware ─────────────────────────────────────────────────────────────
 	var effectiveLimiter httpmiddleware.Limiter
 	if tokenBucketLimiter != nil {
 		effectiveLimiter = tokenBucketLimiter
@@ -241,7 +253,6 @@ func main() {
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// ── Dual authentication ───────────────────────────────────────────────
 		if keyRepo != nil {
 			r.Use(httpmiddleware.APIKeyAuth(keyRepo, log))
 		}
@@ -249,14 +260,12 @@ func main() {
 			r.Use(httpmiddleware.Authenticate(*authCfg))
 		}
 
-		// Token revocation
 		if authCfg != nil && redisClient != nil {
 			dl := infraauth.NewDenyList(redisClient.RDB())
 			r.With(auditOf(domainaudit.ActionTokenRevoke)).
 				Delete("/auth/token", revokeTokenHandler(dl, log))
 		}
 
-		// Workspace create/list (no workspace context needed)
 		if wsCreateH != nil {
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
 			r.With(rlWrite, auditOf(domainaudit.ActionWorkspaceCreate)).
@@ -264,7 +273,6 @@ func main() {
 			r.With(rlRead).Get("/workspaces", wsH.List)
 		}
 
-		// Workspace-scoped routes
 		r.Route("/workspaces/{workspaceID}", func(r chi.Router) {
 			if wsRepo != nil {
 				r.Use(httpmiddleware.WorkspaceAuth(wsRepo))
@@ -272,63 +280,62 @@ func main() {
 
 			wsH := handler.NewWorkspaceHandler(wsCreateH, wsGetH, wsListH, memberAddH, memberListH, log)
 			r.With(rlRead).Get("/", wsH.Get)
-
 			r.With(rlWrite,
 				httpmiddleware.RequireAction(domainworkspace.ActionManageMembers),
 				auditOf(domainaudit.ActionMemberAdd),
 			).Post("/members", wsH.AddMember)
 			r.With(rlRead).Get("/members", wsH.ListMembers)
 
-			// ── URL CRUD ──────────────────────────────────────────────────────
-			// This is the complete URL resource endpoint set, wired with:
-			//   - Workspace-scoped auth (WorkspaceAuth already applied above)
-			//   - Role-based action enforcement (RequireAction)
-			//   - Rate limiting per endpoint class
-			//   - Audit logging per mutating operation
 			r.Route("/urls", func(r chi.Router) {
 				urlH := handler.NewURLHandler(urlGetH, urlListH, urlUpdateH, urlDeleteH, log)
 
-				// POST /urls — create (shorten)
 				if shortenUseCase != nil {
 					r.With(rlWrite,
 						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
 						auditOf(domainaudit.ActionURLCreate),
-					).Post("/",
-						handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+					).Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
 				}
-
-				// GET /urls — list with pagination + filtering
 				if urlListH != nil {
-					r.With(rlRead,
-						httpmiddleware.RequireAction(domainworkspace.ActionViewURL),
-					).Get("/", urlH.List)
+					r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewURL)).
+						Get("/", urlH.List)
 				}
 
-				// GET /urls/{urlID} — get single URL
-				if urlGetH != nil {
-					r.With(rlRead,
-						httpmiddleware.RequireAction(domainworkspace.ActionViewURL),
-					).Get("/{urlID}", urlH.Get)
-				}
+				r.Route("/{urlID}", func(r chi.Router) {
+					if urlGetH != nil {
+						r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewURL)).
+							Get("/", urlH.Get)
+					}
+					if urlUpdateH != nil {
+						r.With(rlWrite,
+							httpmiddleware.RequireAction(domainworkspace.ActionUpdateURL),
+							auditOf(domainaudit.ActionURLUpdate),
+						).Patch("/", urlH.Update)
+					}
+					if urlDeleteH != nil {
+						r.With(rlWrite,
+							httpmiddleware.RequireAction(domainworkspace.ActionDeleteURL),
+							auditOf(domainaudit.ActionURLDelete),
+						).Delete("/", urlH.Delete)
+					}
 
-				// PATCH /urls/{urlID} — partial update
-				if urlUpdateH != nil {
-					r.With(rlWrite,
-						httpmiddleware.RequireAction(domainworkspace.ActionUpdateURL),
-						auditOf(domainaudit.ActionURLUpdate),
-					).Patch("/{urlID}", urlH.Update)
-				}
-
-				// DELETE /urls/{urlID} — soft delete
-				if urlDeleteH != nil {
-					r.With(rlWrite,
-						httpmiddleware.RequireAction(domainworkspace.ActionDeleteURL),
-						auditOf(domainaudit.ActionURLDelete),
-					).Delete("/{urlID}", urlH.Delete)
-				}
+					// ── Analytics sub-routes ────────────────────────────────
+					// Analytics endpoints are read-only — any workspace member
+					// with ViewURL permission can access them.
+					// Rate limited as reads (not writes).
+					if analyticsSummaryH != nil {
+						analyticsH := handler.NewAnalyticsHandler(
+							analyticsSummaryH, analyticsTimeSeriesH, analyticsBreakdownH, log,
+						)
+						r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+							Get("/analytics", analyticsH.GetSummary)
+						r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+							Get("/analytics/timeseries", analyticsH.GetTimeSeries)
+						r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+							Get("/analytics/breakdown", analyticsH.GetBreakdown)
+					}
+				})
 			})
 
-			// API key management
 			if keyCreateH != nil {
 				keyH := handler.NewAPIKeyHandler(keyCreateH, keyRevokeH, keyListH, log)
 				r.With(rlRead).Get("/api-keys", keyH.List)
@@ -343,7 +350,6 @@ func main() {
 			}
 		})
 
-		// Legacy /urls route — maintained for backwards compatibility
 		if shortenUseCase != nil {
 			r.With(rlWrite, auditOf(domainaudit.ActionURLCreate)).
 				Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
@@ -389,17 +395,14 @@ func main() {
 	}
 
 	statsCancel()
-
 	shutdownCtx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)
 	defer cancel()
 
-	log.Info("stopping http server")
 	_ = srv.Shutdown(shutdownCtx)
 	_ = metricsSrv.Shutdown(shutdownCtx)
 
 	if auditSvc != nil {
-		log.Info("flushing audit events")
 		auditCancel()
 		auditSvc.Shutdown(shutdownCtx)
 	}
@@ -413,8 +416,6 @@ func main() {
 	_ = otelShutdown(shutdownCtx)
 	log.Info("shutdown complete")
 }
-
-// ── Supporting handlers and helpers ───────────────────────────────────────────
 
 type noopLimiter struct{}
 
