@@ -58,7 +58,7 @@ func TestRedirectHandler_Handle_Success_302(t *testing.T) {
 			CacheStatus: "hit",
 		},
 	}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	w := httptest.NewRecorder()
 	h.Handle(w, redirectRequest("abc1234"))
@@ -89,7 +89,7 @@ func TestRedirectHandler_Handle_ShortCodePassedToUseCase(t *testing.T) {
 			CacheStatus: "miss",
 		},
 	}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	w := httptest.NewRecorder()
 	h.Handle(w, redirectRequest("mycode"))
@@ -104,7 +104,7 @@ func TestRedirectHandler_Handle_RequestMetadataPopulated(t *testing.T) {
 	mock := &mockResolver{
 		result: &resolve.Result{OriginalURL: "https://example.com", ShortCode: "meta1"},
 	}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	r := httptest.NewRequest(http.MethodGet, "/meta1", nil)
 	r.Header.Set("User-Agent", "TestAgent/1.0")
@@ -127,7 +127,7 @@ func TestRedirectHandler_Handle_RequestMetadataPopulated(t *testing.T) {
 
 func TestRedirectHandler_Handle_NotFound_Returns404(t *testing.T) {
 	mock := &mockResolver{err: apperrors.ErrNotFound}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	w := httptest.NewRecorder()
 	h.Handle(w, redirectRequest("ghost"))
@@ -148,7 +148,7 @@ func TestRedirectHandler_Handle_NotFound_Returns404(t *testing.T) {
 
 func TestRedirectHandler_Handle_Expired_Returns410(t *testing.T) {
 	mock := &mockResolver{err: apperrors.ErrURLExpired}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	w := httptest.NewRecorder()
 	h.Handle(w, redirectRequest("oldlink"))
@@ -166,7 +166,7 @@ func TestRedirectHandler_Handle_Expired_Returns410(t *testing.T) {
 func TestRedirectHandler_Handle_Disabled_Returns404(t *testing.T) {
 	// Disabled URLs return 404 (not 403) to prevent information leakage.
 	mock := &mockResolver{err: apperrors.ErrURLDisabled}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	w := httptest.NewRecorder()
 	h.Handle(w, redirectRequest("disabled1"))
@@ -178,7 +178,7 @@ func TestRedirectHandler_Handle_Disabled_Returns404(t *testing.T) {
 
 func TestRedirectHandler_Handle_InfrastructureError_Returns500(t *testing.T) {
 	mock := &mockResolver{err: errors.New("redis: connection refused")}
-	h := handler.NewRedirectHandler(mock, testLog)
+	h := handler.NewRedirectHandler(mock, testLog, nil)
 
 	w := httptest.NewRecorder()
 	h.Handle(w, redirectRequest("anything"))
@@ -193,7 +193,7 @@ func TestRedirectHandler_Handle_InfrastructureError_Returns500(t *testing.T) {
 }
 
 func TestRedirectHandler_Handle_EmptyShortCode_Returns404(t *testing.T) {
-	h := handler.NewRedirectHandler(&mockResolver{}, testLog)
+	h := handler.NewRedirectHandler(&mockResolver{}, testLog, nil)
 
 	// Request with empty shortcode in chi context
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -220,7 +220,7 @@ func TestRedirectHandler_Handle_CacheHit_vs_Miss_LogsDifferently(t *testing.T) {
 					CacheStatus: cacheStatus,
 				},
 			}
-			h := handler.NewRedirectHandler(mock, testLog)
+			h := handler.NewRedirectHandler(mock, testLog, nil)
 
 			w := httptest.NewRecorder()
 			h.Handle(w, redirectRequest("test"))

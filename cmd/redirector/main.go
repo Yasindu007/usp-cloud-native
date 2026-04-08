@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	appanalytics "github.com/urlshortener/platform/internal/application/analytics"
 	"github.com/urlshortener/platform/internal/application/resolve"
 	"github.com/urlshortener/platform/internal/config"
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
@@ -22,6 +23,7 @@ import (
 	"github.com/urlshortener/platform/internal/interfaces/http/handler"
 	httpmiddleware "github.com/urlshortener/platform/internal/interfaces/http/middleware"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
+	"github.com/urlshortener/platform/pkg/iphasher"
 	"github.com/urlshortener/platform/pkg/logger"
 	"github.com/urlshortener/platform/pkg/telemetry"
 
@@ -50,7 +52,10 @@ func main() {
 		slog.String("env", cfg.Environment),
 	)
 	slog.SetDefault(log)
-	log.Info("starting redirect-service", slog.String("port", cfg.RedirectPort))
+	log.Info("starting redirect-service",
+		slog.String("port", cfg.RedirectPort),
+		slog.String("build_time", buildTime),
+	)
 
 	ctx := context.Background()
 
@@ -70,6 +75,7 @@ func main() {
 
 	appMetrics := metrics.New("redirect-service", version, commit)
 
+	// ── PostgreSQL ────────────────────────────────────────────────────────────
 	var dbClient *postgres.Client
 	if cfg.DBPrimaryDSN != "" {
 		dbCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -80,8 +86,11 @@ func main() {
 			os.Exit(1)
 		}
 		log.Info("postgresql connected")
+	} else {
+		log.Warn("DB_PRIMARY_DSN not set — running without database")
 	}
 
+	// ── Redis ─────────────────────────────────────────────────────────────────
 	var redisClient *redisinfra.Client
 	if cfg.RedisAddr != "" {
 		redisCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -92,27 +101,24 @@ func main() {
 			os.Exit(1)
 		}
 		log.Info("redis connected")
+	} else {
+		log.Warn("REDIS_ADDR not set — running without cache")
 	}
 
-	// ── Rate limiter (redirect-specific policy) ───────────────────────────────
-	// The redirect service uses the ClassRedirect policy, which is
-	// significantly more permissive than write operations:
-	//   unauthenticated: 300 req/60s (vs 10 req/60s for writes)
-	//   free tier:      1000 req/60s (vs 100 req/60s for writes)
-	//
-	// This reflects the production reality: a single viral tweet can
-	// generate thousands of redirects in seconds. The redirect service
-	// must handle this gracefully. We rate limit only to prevent outright
-	// abuse, not to gate legitimate viral traffic.
+	// ── Rate limiter ──────────────────────────────────────────────────────────
 	var tokenBucketLimiter *redisinfra.TokenBucketLimiter
 	if redisClient != nil {
 		tokenBucketLimiter = redisinfra.NewTokenBucketLimiter(redisClient)
 		log.Info("rate limiter enabled (redirect class)")
 	}
 
+	// ── Infrastructure adapters ───────────────────────────────────────────────
 	var urlRepo *postgres.URLRepository
+	var analyticsRepo *postgres.AnalyticsRepository
+
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
+		analyticsRepo = postgres.NewAnalyticsRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -120,14 +126,51 @@ func main() {
 		urlCache = redisinfra.NewURLCache(redisClient)
 	}
 
+	// ── Analytics ingestion service ───────────────────────────────────────────
+	// The analytics service is the key addition in Story 3.1.
+	// It starts its background drainer goroutine immediately and runs until
+	// analyticsCancel() is called during shutdown.
+	//
+	// Shutdown ordering:
+	//   1. Stop HTTP server (no more redirects → no more events produced)
+	//   2. analyticsCancel() → drainer goroutine exits
+	//   3. analyticsService.Shutdown() → drain remaining channel events
+	//   4. Close DB connection (analytics writes complete)
+	//
+	// IP hash salt is loaded from environment (IP_HASH_SALT).
+	// If unset, hashing still works but privacy guarantees are weaker.
+	analyticsCtx, analyticsCancel := context.WithCancel(ctx)
+	var analyticsSvc *appanalytics.Service
+
+	if analyticsRepo != nil {
+		ipHashSalt := getEnvOrDefault("IP_HASH_SALT", "")
+		if ipHashSalt == "" {
+			log.Warn("IP_HASH_SALT not set — IP hashing uses empty secret (weaker privacy)")
+		}
+		hasher := iphasher.New(ipHashSalt)
+		analyticsSvc = appanalytics.NewService(analyticsCtx, analyticsRepo, hasher, log)
+		log.Info("analytics ingestion service started")
+	} else {
+		log.Warn("analytics service disabled — database not configured")
+		analyticsCancel() // cancel unused context immediately
+	}
+
+	// ── Application layer ─────────────────────────────────────────────────────
 	resolveUseCase := resolve.NewHandler(
 		urlRepo, urlCache,
 		cfg.RedirectCacheTTLS, cfg.CacheNegativeTTLS, log,
 	)
 
-	redirectHTTPHandler := handler.NewRedirectHandler(resolveUseCase, log, appMetrics)
+	// Build the redirect HTTP handler with analytics wired in.
+	// analyticsSvc may be nil — handler.NewRedirectHandler is nil-safe.
+	redirectHTTPHandler := handler.NewRedirectHandler(
+		resolveUseCase,
+		log,
+		analyticsSvc, // nil when DB not configured
+		appMetrics,
+	)
 
-	// Effective limiter (no-op if Redis unavailable)
+	// ── Rate limit middleware ─────────────────────────────────────────────────
 	var effectiveLimiter httpmiddleware.Limiter
 	if tokenBucketLimiter != nil {
 		effectiveLimiter = tokenBucketLimiter
@@ -138,19 +181,14 @@ func main() {
 	rlRedirect := httpmiddleware.RateLimit(httpmiddleware.RateLimitConfig{
 		Limiter:       effectiveLimiter,
 		ServiceName:   "redirect-service",
-		Metrics:       appMetrics,
 		EndpointClass: ratelimit.ClassRedirect,
 		Log:           log,
-		// Redirect service always fails open — a Redis blip must not
-		// take down link resolution. Availability SLO > rate limit enforcement.
-		FailOpen: true,
+		FailOpen:      true, // Redis blip must NEVER cause redirect outage
 	})
 
+	// ── Router ────────────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Redirect service middleware — intentionally leaner than API service.
-	// No auth middleware: redirects are public (no JWT/API key needed).
-	// No WorkspaceAuth: redirects are not workspace-scoped operations.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(httpmiddleware.OTel("redirect-service"))
@@ -165,20 +203,27 @@ func main() {
 	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
+
 		if dbClient != nil {
 			if err := dbClient.Ping(pingCtx); err != nil {
+				log.Warn("readiness: db ping failed", slog.String("error", err.Error()))
 				response.WriteProblem(w, response.Problem{
-					Type: response.ProblemTypeInternal, Title: "Not Ready",
-					Status: http.StatusServiceUnavailable, Detail: "database unreachable",
+					Type:   response.ProblemTypeInternal,
+					Title:  "Not Ready",
+					Status: http.StatusServiceUnavailable,
+					Detail: "database unreachable",
 				})
 				return
 			}
 		}
 		if redisClient != nil {
 			if err := redisClient.Ping(pingCtx); err != nil {
+				log.Warn("readiness: redis ping failed", slog.String("error", err.Error()))
 				response.WriteProblem(w, response.Problem{
-					Type: response.ProblemTypeInternal, Title: "Not Ready",
-					Status: http.StatusServiceUnavailable, Detail: "cache unreachable",
+					Type:   response.ProblemTypeInternal,
+					Title:  "Not Ready",
+					Status: http.StatusServiceUnavailable,
+					Detail: "cache unreachable",
 				})
 				return
 			}
@@ -186,11 +231,11 @@ func main() {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
-	// The redirect route — rate limited per IP (no auth on this service).
-	// Rate limit applied PER ROUTE so health probes are never rate limited.
+	// The redirect route — rate limited, analytics captured.
+	// Health probes above are deliberately outside the rate limit.
 	r.With(rlRedirect).Get("/{shortcode}", redirectHTTPHandler.Handle)
 
-	// Metrics server
+	// ── Servers ───────────────────────────────────────────────────────────────
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", appMetrics.Handler())
 	metricsSrv := &http.Server{Addr: ":" + redirectMetricsPort, Handler: metricsMux}
@@ -216,6 +261,7 @@ func main() {
 		}
 	}()
 
+	// Pool stats background collector
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
@@ -237,8 +283,10 @@ func main() {
 		}
 	}()
 
+	// ── Graceful shutdown ─────────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
 	select {
 	case err := <-serverErr:
 		log.Error("server error", slog.String("error", err.Error()))
@@ -247,12 +295,24 @@ func main() {
 	}
 
 	statsCancel()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(),
-		time.Duration(cfg.RedirectShutdownTimeoutS)*time.Second)
+
+	shutdownCtx, cancel := context.WithTimeout(
+		context.Background(),
+		time.Duration(cfg.RedirectShutdownTimeoutS)*time.Second,
+	)
 	defer cancel()
 
+	// Shutdown order (analytics must flush before DB closes):
+	log.Info("stopping http server")
 	_ = srv.Shutdown(shutdownCtx)
 	_ = metricsSrv.Shutdown(shutdownCtx)
+
+	if analyticsSvc != nil {
+		log.Info("flushing analytics events")
+		analyticsCancel()
+		analyticsSvc.Shutdown(shutdownCtx)
+	}
+
 	if redisClient != nil {
 		_ = redisClient.Close()
 	}
@@ -263,7 +323,7 @@ func main() {
 	log.Info("shutdown complete")
 }
 
-// noopLimiter always allows requests — used when Redis is unavailable.
+// noopLimiter allows all requests — used when Redis is unavailable.
 type noopLimiter struct{}
 
 func (n *noopLimiter) Check(_ context.Context, _ string, policy ratelimit.Policy) (*ratelimit.Result, error) {
@@ -273,4 +333,11 @@ func (n *noopLimiter) Check(_ context.Context, _ string, policy ratelimit.Policy
 		Limit:     policy.BucketCapacity(),
 		ResetAt:   time.Now().Add(policy.Window),
 	}, nil
+}
+
+func getEnvOrDefault(key, defaultVal string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultVal
 }
