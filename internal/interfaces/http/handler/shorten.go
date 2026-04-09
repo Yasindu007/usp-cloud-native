@@ -14,6 +14,7 @@ import (
 	"github.com/urlshortener/platform/internal/application/shorten"
 	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
+	domainwebhook "github.com/urlshortener/platform/internal/domain/webhook"
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
@@ -46,6 +47,7 @@ type ShortenResponse struct {
 type ShortenHandler struct {
 	shortener URLShortener
 	metrics   *metrics.Metrics
+	webhooks  WebhookDispatcher
 	log       *slog.Logger
 }
 
@@ -56,6 +58,11 @@ func NewShortenHandler(shortener URLShortener, log *slog.Logger, m ...*metrics.M
 		met = m[0]
 	}
 	return &ShortenHandler{shortener: shortener, metrics: met, log: log}
+}
+
+func (h *ShortenHandler) WithWebhookDispatcher(dispatcher WebhookDispatcher) *ShortenHandler {
+	h.webhooks = dispatcher
+	return h
 }
 
 // Handle processes POST /api/v1/urls.
@@ -119,6 +126,25 @@ func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
 
 	if h.metrics != nil {
 		h.metrics.RecordURLShortened()
+	}
+	if h.webhooks != nil {
+		if err := h.webhooks.Dispatch(r.Context(), domainwebhook.Event{
+			Type:        domainwebhook.EventURLCreated,
+			EventID:     result.ID,
+			WorkspaceID: result.WorkspaceID,
+			OccurredAt:  time.Now().UTC(),
+			Data: map[string]any{
+				"id":           result.ID,
+				"short_code":   result.ShortCode,
+				"original_url": result.OriginalURL,
+				"workspace_id": result.WorkspaceID,
+			},
+		}); err != nil {
+			log.Warn("webhook dispatch failed",
+				slog.String("event_type", string(domainwebhook.EventURLCreated)),
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 
 	log.Info("url shortened",

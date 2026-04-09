@@ -16,6 +16,7 @@ import (
 
 	appanalytics "github.com/urlshortener/platform/internal/application/analytics"
 	"github.com/urlshortener/platform/internal/application/resolve"
+	appwebhook "github.com/urlshortener/platform/internal/application/webhook"
 	"github.com/urlshortener/platform/internal/config"
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
@@ -115,11 +116,13 @@ func main() {
 	// ── Infrastructure adapters ───────────────────────────────────────────────
 	var urlRepo *postgres.URLRepository
 	var analyticsRepo *postgres.AnalyticsRepository
+	var webhookRepo *postgres.WebhookRepository
 	var clickPublisher *redisinfra.ClickPublisher
 
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
 		analyticsRepo = postgres.NewAnalyticsRepository(dbClient)
+		webhookRepo = postgres.NewWebhookRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -162,6 +165,10 @@ func main() {
 		urlRepo, urlCache,
 		cfg.RedirectCacheTTLS, cfg.CacheNegativeTTLS, log,
 	)
+	var webhookDispatcher *appwebhook.Dispatcher
+	if webhookRepo != nil {
+		webhookDispatcher = appwebhook.NewDispatcher(webhookRepo, webhookRepo, log)
+	}
 
 	// Build the redirect HTTP handler with analytics wired in.
 	// analyticsSvc may be nil — handler.NewRedirectHandler is nil-safe.
@@ -170,7 +177,7 @@ func main() {
 		log,
 		analyticsSvc, // nil when DB not configured
 		appMetrics,
-	)
+	).WithWebhookDispatcher(webhookDispatcher)
 
 	// ── Rate limit middleware ─────────────────────────────────────────────────
 	var effectiveLimiter httpmiddleware.Limiter

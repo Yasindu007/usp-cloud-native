@@ -59,6 +59,10 @@ const (
 	ActionAPIKeyCreate Action = "apikey:create"
 	ActionAPIKeyRevoke Action = "apikey:revoke"
 
+	// Webhook actions
+	ActionWebhookCreate Action = "webhook:create"
+	ActionWebhookDelete Action = "webhook:delete"
+
 	// Auth actions
 	ActionTokenRevoke Action = "auth:token_revoke"
 	ActionAuthFailed  Action = "auth:failed"
@@ -72,6 +76,7 @@ const (
 	ResourceWorkspace ResourceType = "workspace"
 	ResourceMember    ResourceType = "member"
 	ResourceAPIKey    ResourceType = "api_key"
+	ResourceWebhook   ResourceType = "webhook"
 	ResourceToken     ResourceType = "token"
 )
 

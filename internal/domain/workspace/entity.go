@@ -44,6 +44,7 @@ const (
 	ActionDeleteURL       Action = "url:delete"
 	ActionViewURL         Action = "url:view"
 	ActionViewAnalytics   Action = "analytics:view"
+	ActionManageWebhooks  Action = "webhook:manage"
 	ActionManageMembers   Action = "members:manage"
 	ActionDeleteWorkspace Action = "workspace:delete"
 	ActionViewMembers     Action = "members:view"
@@ -60,6 +61,7 @@ var rolePermissions = map[Role]map[Action]bool{
 		ActionDeleteURL:       true,
 		ActionViewURL:         true,
 		ActionViewAnalytics:   true,
+		ActionManageWebhooks:  true,
 		ActionManageMembers:   true,
 		ActionDeleteWorkspace: true,
 		ActionViewMembers:     true,
@@ -70,6 +72,7 @@ var rolePermissions = map[Role]map[Action]bool{
 		ActionDeleteURL:       true,
 		ActionViewURL:         true,
 		ActionViewAnalytics:   true,
+		ActionManageWebhooks:  true,
 		ActionManageMembers:   true,
 		ActionDeleteWorkspace: false, // Admins cannot delete the workspace
 		ActionViewMembers:     true,
@@ -80,6 +83,7 @@ var rolePermissions = map[Role]map[Action]bool{
 		ActionDeleteURL:       false,
 		ActionViewURL:         true,
 		ActionViewAnalytics:   true,
+		ActionManageWebhooks:  false,
 		ActionManageMembers:   false,
 		ActionDeleteWorkspace: false,
 		ActionViewMembers:     true,
@@ -90,6 +94,7 @@ var rolePermissions = map[Role]map[Action]bool{
 		ActionDeleteURL:       false,
 		ActionViewURL:         true,
 		ActionViewAnalytics:   true,
+		ActionManageWebhooks:  false,
 		ActionManageMembers:   false,
 		ActionDeleteWorkspace: false,
 		ActionViewMembers:     true,

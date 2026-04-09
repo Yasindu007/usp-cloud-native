@@ -76,6 +76,11 @@ type Config struct {
 	ExportDownloadTTLH  int
 	ExportWorkerPollS   int
 	ExportMaxWindowDays int
+
+	WebhookWorkerEnabled       bool
+	WebhookWorkerBatchSize     int
+	WebhookWorkerPollIntervalS int
+	WebhookWorkerHTTPTimeoutS  int
 }
 
 // Load reads all configuration from environment variables and validates them.
@@ -143,6 +148,11 @@ func Load() (*Config, error) {
 		ExportDownloadTTLH:  getEnvInt("EXPORT_DOWNLOAD_TTL_H", 24),
 		ExportWorkerPollS:   getEnvInt("EXPORT_WORKER_POLL_S", 5),
 		ExportMaxWindowDays: getEnvInt("EXPORT_MAX_WINDOW_DAYS", 365),
+
+		WebhookWorkerEnabled:       getEnvBool("WEBHOOK_WORKER_ENABLED", true),
+		WebhookWorkerBatchSize:     getEnvInt("WEBHOOK_WORKER_BATCH_SIZE", 50),
+		WebhookWorkerPollIntervalS: getEnvInt("WEBHOOK_WORKER_POLL_INTERVAL_S", 5),
+		WebhookWorkerHTTPTimeoutS:  getEnvInt("WEBHOOK_WORKER_HTTP_TIMEOUT_S", 30),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -254,6 +264,15 @@ func (c *Config) validate() error {
 	}
 	if c.ExportWorkerPollS <= 0 {
 		errs = append(errs, "EXPORT_WORKER_POLL_S must be greater than 0")
+	}
+	if c.WebhookWorkerBatchSize <= 0 {
+		errs = append(errs, "WEBHOOK_WORKER_BATCH_SIZE must be greater than 0")
+	}
+	if c.WebhookWorkerPollIntervalS <= 0 {
+		errs = append(errs, "WEBHOOK_WORKER_POLL_INTERVAL_S must be greater than 0")
+	}
+	if c.WebhookWorkerHTTPTimeoutS <= 0 {
+		errs = append(errs, "WEBHOOK_WORKER_HTTP_TIMEOUT_S must be greater than 0")
 	}
 
 	if len(errs) > 0 {

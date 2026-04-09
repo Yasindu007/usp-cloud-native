@@ -13,6 +13,7 @@ import (
 	appanalytics "github.com/urlshortener/platform/internal/application/analytics"
 	"github.com/urlshortener/platform/internal/application/apperrors"
 	"github.com/urlshortener/platform/internal/application/resolve"
+	domainwebhook "github.com/urlshortener/platform/internal/domain/webhook"
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
@@ -34,7 +35,8 @@ type AnalyticsCapturer interface {
 type RedirectHandler struct {
 	resolver  URLResolver
 	analytics AnalyticsCapturer // nil-safe: analytics are optional
-	metrics   *metrics.Metrics  // nil-safe
+	webhooks  WebhookDispatcher
+	metrics   *metrics.Metrics // nil-safe
 	log       *slog.Logger
 }
 
@@ -56,6 +58,11 @@ func NewRedirectHandler(
 		metrics:   met,
 		log:       log,
 	}
+}
+
+func (h *RedirectHandler) WithWebhookDispatcher(dispatcher WebhookDispatcher) *RedirectHandler {
+	h.webhooks = dispatcher
+	return h
 }
 
 // Handle processes GET /{shortcode}.
@@ -131,6 +138,26 @@ func (h *RedirectHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			RequestID:    chimiddleware.GetReqID(r.Context()),
 			OccurredAt:   time.Now().UTC(),
 		})
+	}
+	if h.webhooks != nil {
+		if err := h.webhooks.Dispatch(r.Context(), domainwebhook.Event{
+			Type:        domainwebhook.EventRedirectReceived,
+			EventID:     result.ShortCode + ":" + chimiddleware.GetReqID(r.Context()),
+			WorkspaceID: result.WorkspaceID,
+			OccurredAt:  time.Now().UTC(),
+			Data: map[string]any{
+				"short_code":   result.ShortCode,
+				"original_url": result.OriginalURL,
+				"user_agent":   r.UserAgent(),
+				"referrer":     r.Referer(),
+				"cache_status": result.CacheStatus,
+			},
+		}); err != nil {
+			log.Warn("webhook dispatch failed",
+				slog.String("event_type", string(domainwebhook.EventRedirectReceived)),
+				slog.String("error", err.Error()),
+			)
+		}
 	}
 }
 

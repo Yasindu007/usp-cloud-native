@@ -20,6 +20,7 @@ import (
 	appexport "github.com/urlshortener/platform/internal/application/export"
 	"github.com/urlshortener/platform/internal/application/shorten"
 	appurl "github.com/urlshortener/platform/internal/application/url"
+	appwebhook "github.com/urlshortener/platform/internal/application/webhook"
 	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
 	"github.com/urlshortener/platform/internal/config"
 	infraauth "github.com/urlshortener/platform/internal/infrastructure/auth"
@@ -139,6 +140,7 @@ func main() {
 	var auditRepo *postgres.AuditRepository
 	var analyticsQueryRepo *postgres.AnalyticsQueryRepository
 	var exportRepo *postgres.ExportRepository
+	var webhookRepo *postgres.WebhookRepository
 
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
@@ -147,6 +149,7 @@ func main() {
 		auditRepo = postgres.NewAuditRepository(dbClient)
 		analyticsQueryRepo = postgres.NewAnalyticsQueryRepository(dbClient)
 		exportRepo = postgres.NewExportRepository(dbClient)
+		webhookRepo = postgres.NewWebhookRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -194,6 +197,10 @@ func main() {
 	var analyticsTimeSeriesH *appanalytics.TimeSeriesHandler
 	var analyticsBreakdownH *appanalytics.BreakdownHandler
 	var exportCreateH *appexport.CreateHandler
+	var webhookRegisterH *appwebhook.RegisterHandler
+	var webhookListH *appwebhook.ListHandler
+	var webhookDeleteH *appwebhook.DeleteHandler
+	var webhookDispatcher *appwebhook.Dispatcher
 
 	if urlRepo != nil {
 		shortenUseCase = shorten.NewHandler(
@@ -214,6 +221,12 @@ func main() {
 	}
 	if exportRepo != nil {
 		exportCreateH = appexport.NewCreateHandler(exportRepo, log, cfg.ExportMaxWindowDays)
+	}
+	if webhookRepo != nil {
+		webhookRegisterH = appwebhook.NewRegisterHandler(webhookRepo, log)
+		webhookListH = appwebhook.NewListHandler(webhookRepo)
+		webhookDeleteH = appwebhook.NewDeleteHandler(webhookRepo)
+		webhookDispatcher = appwebhook.NewDispatcher(webhookRepo, webhookRepo, log)
 	}
 
 	var (
@@ -331,15 +344,30 @@ func main() {
 				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
 					Get("/exports/{exportID}", exportH.Get)
 			}
+			if webhookRegisterH != nil {
+				webhookH := handler.NewWebhookHandler(webhookRegisterH, webhookListH, webhookDeleteH, log)
+				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionManageWebhooks)).
+					Get("/webhooks", webhookH.List)
+				r.With(rlWrite,
+					httpmiddleware.RequireAction(domainworkspace.ActionManageWebhooks),
+					auditOf(domainaudit.ActionWebhookCreate),
+				).Post("/webhooks", webhookH.Register)
+				r.With(rlWrite,
+					httpmiddleware.RequireAction(domainworkspace.ActionManageWebhooks),
+					auditOf(domainaudit.ActionWebhookDelete),
+				).Delete("/webhooks/{webhookID}", webhookH.Delete)
+			}
 
 			r.Route("/urls", func(r chi.Router) {
-				urlH := handler.NewURLHandler(urlGetH, urlListH, urlUpdateH, urlDeleteH, log)
+				urlH := handler.NewURLHandler(urlGetH, urlListH, urlUpdateH, urlDeleteH, log).
+					WithWebhookDispatcher(webhookDispatcher)
 
 				if shortenUseCase != nil {
 					r.With(rlWrite,
 						httpmiddleware.RequireAction(domainworkspace.ActionCreateURL),
 						auditOf(domainaudit.ActionURLCreate),
-					).Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+					).Post("/", handler.NewShortenHandler(shortenUseCase, log, appMetrics).
+						WithWebhookDispatcher(webhookDispatcher).Handle)
 				}
 				if urlListH != nil {
 					r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewURL)).
@@ -403,7 +431,8 @@ func main() {
 
 		if shortenUseCase != nil {
 			r.With(rlWrite, auditOf(domainaudit.ActionURLCreate)).
-				Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).Handle)
+				Post("/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).
+					WithWebhookDispatcher(webhookDispatcher).Handle)
 		}
 	})
 
@@ -450,6 +479,16 @@ func main() {
 			time.Duration(cfg.ExportWorkerPollS)*time.Second,
 		).Run(exportWorkerCtx)
 	}
+	var webhookWorkerCancel context.CancelFunc
+	if webhookRepo != nil && cfg.WebhookWorkerEnabled {
+		webhookWorkerCtx, cancel := context.WithCancel(ctx)
+		webhookWorkerCancel = cancel
+		go appwebhook.NewWorker(webhookRepo, webhookRepo, appwebhook.WorkerConfig{
+			BatchSize:    cfg.WebhookWorkerBatchSize,
+			PollInterval: time.Duration(cfg.WebhookWorkerPollIntervalS) * time.Second,
+			HTTPTimeout:  time.Duration(cfg.WebhookWorkerHTTPTimeoutS) * time.Second,
+		}, log).Run(webhookWorkerCtx)
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -463,6 +502,9 @@ func main() {
 	statsCancel()
 	if exportWorkerCancel != nil {
 		exportWorkerCancel()
+	}
+	if webhookWorkerCancel != nil {
+		webhookWorkerCancel()
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)

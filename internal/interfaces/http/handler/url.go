@@ -16,6 +16,7 @@ import (
 	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
 	domainauth "github.com/urlshortener/platform/internal/domain/auth"
 	domainurl "github.com/urlshortener/platform/internal/domain/url"
+	domainwebhook "github.com/urlshortener/platform/internal/domain/webhook"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/logger"
 )
@@ -40,6 +41,10 @@ type URLUpdater interface {
 // URLDeleter soft-deletes a URL.
 type URLDeleter interface {
 	Handle(ctx context.Context, cmd appurl.DeleteCommand) error
+}
+
+type WebhookDispatcher interface {
+	Dispatch(ctx context.Context, event domainwebhook.Event) error
 }
 
 // ── Request / Response types ──────────────────────────────────────────────────
@@ -94,11 +99,12 @@ type ListMeta struct {
 // Each handler method is responsible only for parsing, calling the use case,
 // annotating the audit context, and writing the response.
 type URLHandler struct {
-	getter  URLGetter
-	lister  URLLister
-	updater URLUpdater
-	deleter URLDeleter
-	log     *slog.Logger
+	getter   URLGetter
+	lister   URLLister
+	updater  URLUpdater
+	deleter  URLDeleter
+	webhooks WebhookDispatcher
+	log      *slog.Logger
 }
 
 // NewURLHandler constructs a URLHandler.
@@ -116,6 +122,11 @@ func NewURLHandler(
 		deleter: deleter,
 		log:     log,
 	}
+}
+
+func (h *URLHandler) WithWebhookDispatcher(dispatcher WebhookDispatcher) *URLHandler {
+	h.webhooks = dispatcher
+	return h
 }
 
 // ── GET /api/v1/workspaces/{workspaceID}/urls/{urlID} ─────────────────────────
@@ -270,6 +281,26 @@ func (h *URLHandler) Update(w http.ResponseWriter, r *http.Request) {
 	response.JSON(w, http.StatusOK, response.Envelope{
 		Data: toURLResponse(result),
 	})
+	if h.webhooks != nil {
+		if err := h.webhooks.Dispatch(r.Context(), domainwebhook.Event{
+			Type:        domainwebhook.EventURLUpdated,
+			EventID:     result.ID,
+			WorkspaceID: result.WorkspaceID,
+			OccurredAt:  time.Now().UTC(),
+			Data: map[string]any{
+				"id":           result.ID,
+				"short_code":   result.ShortCode,
+				"original_url": result.OriginalURL,
+				"title":        result.Title,
+				"workspace_id": result.WorkspaceID,
+			},
+		}); err != nil {
+			log.Warn("webhook dispatch failed",
+				slog.String("event_type", string(domainwebhook.EventURLUpdated)),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 }
 
 // ── DELETE /api/v1/workspaces/{workspaceID}/urls/{urlID} ──────────────────────
@@ -306,6 +337,24 @@ func (h *URLHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		urlID,
 		map[string]any{"deleted_by": claims.UserID},
 	)
+	if h.webhooks != nil {
+		if err := h.webhooks.Dispatch(r.Context(), domainwebhook.Event{
+			Type:        domainwebhook.EventURLDeleted,
+			EventID:     urlID,
+			WorkspaceID: claims.WorkspaceID,
+			OccurredAt:  time.Now().UTC(),
+			Data: map[string]any{
+				"id":           urlID,
+				"workspace_id": claims.WorkspaceID,
+				"deleted_by":   claims.UserID,
+			},
+		}); err != nil {
+			log.Warn("webhook dispatch failed",
+				slog.String("event_type", string(domainwebhook.EventURLDeleted)),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
