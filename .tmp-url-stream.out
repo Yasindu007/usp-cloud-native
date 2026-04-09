@@ -1,0 +1,1 @@
+﻿{"type":"https://docs.shortener.example.com/errors/internal-server-error","title":"Internal Server Error","status":500,"detail":"An unexpected error occurred. Please try again later.","instance":"/api/v1/workspaces/01KNNN6HYGGW5FV8SBE2BWJ8A7/urls/01KNQXTS5P93XRQBMD9JA4BBBQ/stream"}

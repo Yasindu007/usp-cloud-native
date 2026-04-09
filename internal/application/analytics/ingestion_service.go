@@ -58,6 +58,11 @@ type Writer interface {
 	IncrementClickCounts(ctx context.Context, counts map[string]int64) error
 }
 
+// Publisher emits real-time click events for SSE streaming.
+type Publisher interface {
+	Publish(ctx context.Context, evt *analytics.ClickEvent) error
+}
+
 // Service manages analytics event capture, enrichment, and persistence.
 type Service struct {
 	writer        Writer
@@ -68,6 +73,7 @@ type Service struct {
 	log           *slog.Logger
 	stopDrainer   context.CancelFunc
 	drainerDone   chan struct{}
+	publisher     Publisher
 
 	// droppedEvents tracks events lost due to channel saturation.
 	droppedEvents atomic.Int64
@@ -79,8 +85,12 @@ type Service struct {
 // The background drainer goroutine starts immediately and runs until
 // ctx is cancelled. Call Shutdown() during graceful shutdown to flush
 // any buffered events before process exit.
-func NewService(ctx context.Context, writer Writer, hasher *iphasher.Hasher, log *slog.Logger) *Service {
+func NewService(ctx context.Context, writer Writer, hasher *iphasher.Hasher, log *slog.Logger, publishers ...Publisher) *Service {
 	drainerCtx, cancel := context.WithCancel(ctx)
+	var publisher Publisher
+	if len(publishers) > 0 {
+		publisher = publishers[0]
+	}
 	s := &Service{
 		writer:        writer,
 		hasher:        hasher,
@@ -90,6 +100,7 @@ func NewService(ctx context.Context, writer Writer, hasher *iphasher.Hasher, log
 		log:           log,
 		stopDrainer:   cancel,
 		drainerDone:   make(chan struct{}),
+		publisher:     publisher,
 	}
 	go s.runDrainer(drainerCtx)
 	return s
@@ -169,6 +180,27 @@ func (s *Service) Capture(req CaptureRequest) {
 		ReferrerDomain: referrerDomain,
 		ReferrerRaw:    referrerRaw,
 		RequestID:      req.RequestID,
+	}
+
+	if s.publisher != nil && !evt.IsBot {
+		clickEvt := &analytics.ClickEvent{
+			ShortCode:   evt.ShortCode,
+			WorkspaceID: evt.WorkspaceID,
+			OccurredAt:  evt.OccurredAt,
+			Referrer:    evt.ReferrerDomain,
+			DeviceType:  string(evt.DeviceType),
+			CountryCode: evt.CountryCode,
+			IsBot:       evt.IsBot,
+			RequestID:   evt.RequestID,
+		}
+		go func() {
+			if err := s.publisher.Publish(context.Background(), clickEvt); err != nil {
+				s.log.Warn("analytics click publish failed",
+					slog.String("short_code", clickEvt.ShortCode),
+					slog.String("error", err.Error()),
+				)
+			}
+		}()
 	}
 
 	select {

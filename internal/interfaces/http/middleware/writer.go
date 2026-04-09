@@ -63,3 +63,11 @@ func (rw *statusResponseWriter) Write(b []byte) (int, error) {
 func (rw *statusResponseWriter) Status() int {
 	return rw.status
 }
+
+// Flush forwards streaming flushes to the underlying writer when supported.
+// SSE handlers depend on this through middleware wrappers.
+func (rw *statusResponseWriter) Flush() {
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}

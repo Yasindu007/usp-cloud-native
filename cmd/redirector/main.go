@@ -115,6 +115,7 @@ func main() {
 	// ── Infrastructure adapters ───────────────────────────────────────────────
 	var urlRepo *postgres.URLRepository
 	var analyticsRepo *postgres.AnalyticsRepository
+	var clickPublisher *redisinfra.ClickPublisher
 
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
@@ -124,6 +125,7 @@ func main() {
 	var urlCache *redisinfra.URLCache
 	if redisClient != nil {
 		urlCache = redisinfra.NewURLCache(redisClient)
+		clickPublisher = redisinfra.NewClickPublisher(redisClient)
 	}
 
 	// ── Analytics ingestion service ───────────────────────────────────────────
@@ -148,7 +150,7 @@ func main() {
 			log.Warn("IP_HASH_SALT not set — IP hashing uses empty secret (weaker privacy)")
 		}
 		hasher := iphasher.New(ipHashSalt)
-		analyticsSvc = appanalytics.NewService(analyticsCtx, analyticsRepo, hasher, log)
+		analyticsSvc = appanalytics.NewService(analyticsCtx, analyticsRepo, hasher, log, clickPublisher)
 		log.Info("analytics ingestion service started")
 	} else {
 		log.Warn("analytics service disabled — database not configured")

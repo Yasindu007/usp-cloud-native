@@ -145,8 +145,10 @@ func main() {
 	}
 
 	var urlCache *redisinfra.URLCache
+	var clickSubscriber *redisinfra.ClickSubscriber
 	if redisClient != nil {
 		urlCache = redisinfra.NewURLCache(redisClient)
+		clickSubscriber = redisinfra.NewClickSubscriber(redisClient)
 	}
 
 	// ── Audit service ─────────────────────────────────────────────────────────
@@ -286,6 +288,12 @@ func main() {
 			).Post("/members", wsH.AddMember)
 			r.With(rlRead).Get("/members", wsH.ListMembers)
 
+			if clickSubscriber != nil && urlRepo != nil {
+				streamH := handler.NewStreamHandler(urlRepo, clickSubscriber, log)
+				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+					Get("/stream", streamH.StreamWorkspace)
+			}
+
 			r.Route("/urls", func(r chi.Router) {
 				urlH := handler.NewURLHandler(urlGetH, urlListH, urlUpdateH, urlDeleteH, log)
 
@@ -332,6 +340,11 @@ func main() {
 							Get("/analytics/timeseries", analyticsH.GetTimeSeries)
 						r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
 							Get("/analytics/breakdown", analyticsH.GetBreakdown)
+					}
+					if clickSubscriber != nil && urlRepo != nil {
+						streamH := handler.NewStreamHandler(urlRepo, clickSubscriber, log)
+						r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+							Get("/stream", streamH.StreamURL)
 					}
 				})
 			})
