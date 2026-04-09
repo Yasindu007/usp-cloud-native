@@ -6,6 +6,12 @@ REGISTRY="${REGISTRY:-localhost:5001}"
 NAMESPACE="${NAMESPACE:-urlshortener}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+for candidate in "$HOME/go/bin" "/c/Program Files/Docker/Docker/resources/bin"; do
+  if [ -d "$candidate" ] && [[ ":$PATH:" != *":$candidate:"* ]]; then
+    PATH="$candidate:$PATH"
+  fi
+done
+
 log() { printf '==> %s\n' "$*"; }
 
 kubectl config use-context kind-urlshortener >/dev/null

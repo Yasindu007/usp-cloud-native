@@ -1,12 +1,12 @@
 # ============================================================
-# URL Shortener Platform — Makefile
+# URL Shortener Platform - Makefile
 # ============================================================
 
 .DEFAULT_GOAL := help
 
 ifeq ($(OS),Windows_NT)
-  ifneq ($(wildcard C:/Progra~1/Git/usr/bin/sh.exe),)
-    SHELL := C:/Progra~1/Git/usr/bin/sh.exe
+  ifneq ($(wildcard C:/Progra~1/Git/bin/bash.exe),)
+    SHELL := C:/Progra~1/Git/bin/bash.exe
   else ifneq ($(wildcard C:/msys64/usr/bin/bash.exe),)
     SHELL := C:/msys64/usr/bin/bash.exe
   else
@@ -16,13 +16,10 @@ else
   SHELL := /bin/bash
 endif
 
-# Build configuration
-MODULE          := github.com/urlshortener/platform
-BUILD_DIR       := ./bin
-API_BINARY      := $(BUILD_DIR)/api
-REDIRECT_BINARY := $(BUILD_DIR)/redirector
+BUILD_DIR    := ./bin
+REGISTRY     := localhost:5001
+CLUSTER_NAME := urlshortener
 
-# Versioning (injected at build time)
 GIT_SHA  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
 GIT_TAG  := $(shell git describe --tags --always 2>/dev/null || echo "v0.0.0-dev")
 BUILD_TS := $(shell git log -1 --format=%cI 2>/dev/null || echo "unknown")
@@ -32,125 +29,83 @@ LDFLAGS := -s -w \
 	-X main.commit=$(GIT_SHA) \
 	-X main.buildTime=$(BUILD_TS)
 
-# ============================================================
-# HELP
-# ============================================================
-
 .PHONY: help
 help: ## Show available targets
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-	| awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
-
-# ============================================================
-# BUILD
-# ============================================================
+	@python -c "import pathlib,re; [print('\033[36m{:<28}\033[0m {}'.format(m.group(1), m.group(2))) for line in pathlib.Path('Makefile').read_text().splitlines() for m in [re.match(r'^([A-Za-z_-]+):.*?## (.*)$$', line)] if m]"
 
 .PHONY: build build-api build-redirector
-
-build: build-api build-redirector ## Build all service binaries
+build: build-api build-redirector ## Build all service binaries locally
 
 build-api: ## Build api-service binary
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="$(LDFLAGS)" -o $(API_BINARY) ./cmd/api
+		go build -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/api ./cmd/api
 
 build-redirector: ## Build redirector binary
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="$(LDFLAGS)" -o $(REDIRECT_BINARY) ./cmd/redirector
+		go build -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/redirector ./cmd/redirector
 
-# ============================================================
-# RUN (local development)
-# ============================================================
-
-.PHONY: run-api run-redirector
-
-run-api: ## Run api-service locally (requires infra-up)
+.PHONY: run-api run-redirector run-issuer
+run-api: ## Run api-service locally
 	go run ./cmd/api
 
-run-redirector: ## Run redirector locally (requires infra-up)
+run-redirector: ## Run redirector locally
 	go run ./cmd/redirector
 
-# ============================================================
-# TEST
-# ============================================================
+run-issuer: ## Run local mock JWT issuer
+	go run ./cmd/mockissuer
 
 .PHONY: test test-unit test-integration test-coverage
-
-test: test-unit ## Run unit tests (default)
+test: test-unit ## Run unit tests
 
 test-unit: ## Run unit tests with race detector
 	go test -v -race -count=1 -short ./...
 
-test-integration: ## Run integration tests (requires infra-up)
+test-integration: ## Run integration tests
 	go test -v -race -count=1 -tags=integration ./...
 
-test-coverage: ## Generate test coverage report
+test-coverage: ## Generate coverage report
 	go test -v -race -count=1 -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report: coverage.html"
 
-# ============================================================
-# CODE QUALITY
-# ============================================================
-
-.PHONY: lint vet fmt check
-
-fmt: ## Format all Go source files
+.PHONY: fmt vet lint tidy check
+fmt: ## Format Go files
 	gofmt -w -s .
-	goimports -w .
 
 vet: ## Run go vet
 	go vet ./...
 
-lint: ## Run golangci-lint (must be installed)
+lint: ## Run golangci-lint
 	golangci-lint run --timeout=5m ./...
-
-check: fmt vet lint ## Run all code quality checks
-
-# ============================================================
-# DEPENDENCIES
-# ============================================================
-
-.PHONY: deps tidy
-
-deps: ## Download dependencies
-	go mod download
 
 tidy: ## Tidy and verify modules
 	go mod tidy
 	go mod verify
 
-# ============================================================
-# LOCAL INFRASTRUCTURE (Docker Compose)
-# ============================================================
+check: fmt vet lint ## Run formatting, vet, and lint
 
-.PHONY: infra-up infra-down infra-logs infra-ps
-
-infra-up: ## Start local infrastructure (PostgreSQL + Redis)
+.PHONY: infra-up infra-down infra-destroy infra-logs monitoring-up monitoring-down
+infra-up: ## Start PostgreSQL and Redis
 	docker compose -f docker-compose.dev.yml up -d
-	@echo "Waiting for services to be healthy..."
-	@docker compose -f docker-compose.dev.yml ps
 
-infra-down: ## Stop and remove local infrastructure
+infra-down: ## Stop PostgreSQL and Redis
 	docker compose -f docker-compose.dev.yml down
 
-infra-destroy: ## Stop infrastructure and remove volumes
+infra-destroy: ## Stop PostgreSQL and Redis and remove volumes
 	docker compose -f docker-compose.dev.yml down -v
 
-infra-logs: ## Tail infrastructure logs
+infra-logs: ## Tail PostgreSQL and Redis logs
 	docker compose -f docker-compose.dev.yml logs -f
 
-infra-ps: ## Show infrastructure status
-	docker compose -f docker-compose.dev.yml ps
+monitoring-up: ## Start local Prometheus and Grafana
+	docker compose -f docker-compose.monitoring.yml up -d
 
-# ============================================================
-# DATABASE
-# ============================================================
+monitoring-down: ## Stop local Prometheus and Grafana
+	docker compose -f docker-compose.monitoring.yml down
 
 .PHONY: migrate-up migrate-down migrate-status
-
-migrate-up: ## Run all pending migrations
+migrate-up: ## Apply all pending migrations
 	go run ./cmd/migrate up
 
 migrate-down: ## Roll back last migration
@@ -159,35 +114,72 @@ migrate-down: ## Roll back last migration
 migrate-status: ## Show migration status
 	go run ./cmd/migrate status
 
-# ============================================================
-# DOCKER
-# ============================================================
+.PHONY: registry-up registry-down registry-list
+registry-up: ## Start local registry
+	@if docker inspect urlshortener-registry >/dev/null 2>&1; then \
+		docker start urlshortener-registry >/dev/null 2>&1 || true; \
+	else \
+		docker compose -f docker-compose.registry.yml up -d; \
+	fi
 
-.PHONY: docker-build docker-build-api docker-build-redirector
+registry-down: ## Stop local registry
+	@if docker inspect urlshortener-registry >/dev/null 2>&1; then \
+		docker stop urlshortener-registry >/dev/null 2>&1 || true; \
+	else \
+		docker compose -f docker-compose.registry.yml down; \
+	fi
 
-docker-build: docker-build-api docker-build-redirector ## Build all Docker images
+registry-list: ## List repositories in local registry
+	curl -fsS http://$(REGISTRY)/v2/_catalog || true
 
-docker-build-api: ## Build api-service Docker image
-	docker build \
-		--build-arg SERVICE=api \
-		--build-arg VERSION=$(GIT_TAG) \
-		-t urlshortener/api:$(GIT_TAG) \
-		-t urlshortener/api:latest \
-		.
+.PHONY: docker-build docker-push docker-build-push
+docker-build: ## Build all service images
+	$(SHELL) scripts/build-images.sh $(GIT_SHA)
 
-docker-build-redirector: ## Build redirector Docker image
-	docker build \
-		--build-arg SERVICE=redirector \
-		--build-arg VERSION=$(GIT_TAG) \
-		-t urlshortener/redirector:$(GIT_TAG) \
-		-t urlshortener/redirector:latest \
-		.
+docker-push: ## Push all service images to local registry
+	$(SHELL) scripts/push-images.sh $(GIT_SHA)
 
-# ============================================================
-# CLEAN
-# ============================================================
+docker-build-push: docker-build docker-push ## Build and push all images
 
-.PHONY: clean
+.PHONY: cluster-up cluster-up-no-deploy cluster-down cluster-status cluster-reset verify
+cluster-up: ## Bootstrap kind cluster and deploy manifests when images exist
+	$(SHELL) scripts/setup-kind.sh
 
-clean: ## Remove build artifacts and coverage files
+cluster-up-no-deploy: ## Bootstrap kind cluster only
+	$(SHELL) scripts/setup-kind.sh --skip-manifests
+
+cluster-down: ## Delete kind cluster
+	kind delete cluster --name $(CLUSTER_NAME)
+
+cluster-status: ## Show cluster node and pod status
+	kubectl get nodes -o wide
+	kubectl get pods -A
+
+cluster-reset: cluster-down cluster-up ## Recreate the kind cluster
+
+verify: ## Verify registry, cluster, ingress, and metrics
+	$(SHELL) scripts/verify-cluster.sh
+
+.PHONY: deploy deploy-api deploy-redirector rollback
+deploy: ## Deploy all services to Kubernetes
+	$(SHELL) scripts/deploy.sh
+
+deploy-api: ## Restart api deployment
+	kubectl rollout restart deployment/api -n urlshortener
+	kubectl rollout status deployment/api -n urlshortener --timeout=5m
+
+deploy-redirector: ## Restart redirector deployment
+	kubectl rollout restart deployment/redirector -n urlshortener
+	kubectl rollout status deployment/redirector -n urlshortener --timeout=5m
+
+rollback: ## Roll back api and redirector deployments
+	kubectl rollout undo deployment/api -n urlshortener
+	kubectl rollout undo deployment/redirector -n urlshortener
+
+.PHONY: bootstrap full-deploy clean
+bootstrap: registry-up cluster-up ## Start registry and bootstrap cluster
+
+full-deploy: docker-build-push deploy ## Build, push, and deploy
+
+clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR) coverage.out coverage.html
