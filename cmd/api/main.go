@@ -17,6 +17,7 @@ import (
 	appanalytics "github.com/urlshortener/platform/internal/application/analytics"
 	appkey "github.com/urlshortener/platform/internal/application/apikey"
 	appaudit "github.com/urlshortener/platform/internal/application/audit"
+	appexport "github.com/urlshortener/platform/internal/application/export"
 	"github.com/urlshortener/platform/internal/application/shorten"
 	appurl "github.com/urlshortener/platform/internal/application/url"
 	appworkspace "github.com/urlshortener/platform/internal/application/workspace"
@@ -25,12 +26,14 @@ import (
 	"github.com/urlshortener/platform/internal/infrastructure/metrics"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
 	redisinfra "github.com/urlshortener/platform/internal/infrastructure/redis"
+	"github.com/urlshortener/platform/internal/infrastructure/storage"
 	"github.com/urlshortener/platform/internal/interfaces/http/handler"
 	httpmiddleware "github.com/urlshortener/platform/internal/interfaces/http/middleware"
 	"github.com/urlshortener/platform/internal/interfaces/http/response"
 	"github.com/urlshortener/platform/pkg/jwtutil"
 	"github.com/urlshortener/platform/pkg/logger"
 	"github.com/urlshortener/platform/pkg/shortcode"
+	"github.com/urlshortener/platform/pkg/signedurl"
 	"github.com/urlshortener/platform/pkg/telemetry"
 
 	domainaudit "github.com/urlshortener/platform/internal/domain/audit"
@@ -135,6 +138,7 @@ func main() {
 	var keyRepo *postgres.APIKeyRepository
 	var auditRepo *postgres.AuditRepository
 	var analyticsQueryRepo *postgres.AnalyticsQueryRepository
+	var exportRepo *postgres.ExportRepository
 
 	if dbClient != nil {
 		urlRepo = postgres.NewURLRepository(dbClient)
@@ -142,6 +146,7 @@ func main() {
 		keyRepo = postgres.NewAPIKeyRepository(dbClient)
 		auditRepo = postgres.NewAuditRepository(dbClient)
 		analyticsQueryRepo = postgres.NewAnalyticsQueryRepository(dbClient)
+		exportRepo = postgres.NewExportRepository(dbClient)
 	}
 
 	var urlCache *redisinfra.URLCache
@@ -149,6 +154,22 @@ func main() {
 	if redisClient != nil {
 		urlCache = redisinfra.NewURLCache(redisClient)
 		clickSubscriber = redisinfra.NewClickSubscriber(redisClient)
+	}
+
+	exportStorage, err := storage.NewLocalStorage(cfg.ExportStorageDir)
+	if err != nil {
+		log.Error("export storage init failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	var exportSigner *signedurl.Signer
+	if cfg.ExportSignSecret != "" {
+		exportSigner, err = signedurl.NewFromHex(cfg.ExportSignSecret)
+	} else {
+		exportSigner, err = signedurl.NewRandom()
+	}
+	if err != nil {
+		log.Error("export signer init failed", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	// ── Audit service ─────────────────────────────────────────────────────────
@@ -172,6 +193,7 @@ func main() {
 	var analyticsSummaryH *appanalytics.SummaryHandler
 	var analyticsTimeSeriesH *appanalytics.TimeSeriesHandler
 	var analyticsBreakdownH *appanalytics.BreakdownHandler
+	var exportCreateH *appexport.CreateHandler
 
 	if urlRepo != nil {
 		shortenUseCase = shorten.NewHandler(
@@ -189,6 +211,9 @@ func main() {
 		analyticsTimeSeriesH = appanalytics.NewTimeSeriesHandler(analyticsQueryRepo, urlRepo)
 		analyticsBreakdownH = appanalytics.NewBreakdownHandler(analyticsQueryRepo, urlRepo)
 		log.Info("analytics query handlers enabled")
+	}
+	if exportRepo != nil {
+		exportCreateH = appexport.NewCreateHandler(exportRepo, log, cfg.ExportMaxWindowDays)
 	}
 
 	var (
@@ -253,6 +278,10 @@ func main() {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "alive"})
 	})
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
+	if exportRepo != nil {
+		exportH := handler.NewExportHandler(nil, nil, exportRepo, exportStorage, exportSigner, cfg.APIBaseURL, log)
+		r.Get("/api/v1/exports/{exportID}/download", exportH.Download)
+	}
 
 	r.Route("/api/v1", func(r chi.Router) {
 		if keyRepo != nil {
@@ -292,6 +321,15 @@ func main() {
 				streamH := handler.NewStreamHandler(urlRepo, clickSubscriber, log)
 				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
 					Get("/stream", streamH.StreamWorkspace)
+			}
+			if exportRepo != nil && exportCreateH != nil {
+				exportH := handler.NewExportHandler(exportCreateH, exportRepo, exportRepo, exportStorage, exportSigner, cfg.APIBaseURL, log)
+				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+					Get("/exports", exportH.List)
+				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+					Post("/exports", exportH.Create)
+				r.With(rlRead, httpmiddleware.RequireAction(domainworkspace.ActionViewAnalytics)).
+					Get("/exports/{exportID}", exportH.Get)
 			}
 
 			r.Route("/urls", func(r chi.Router) {
@@ -398,6 +436,21 @@ func main() {
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	go collectPoolStats(statsCtx, appMetrics, dbClient, redisClient)
 
+	var exportWorkerCancel context.CancelFunc
+	if exportRepo != nil {
+		exportWorkerCtx, cancel := context.WithCancel(ctx)
+		exportWorkerCancel = cancel
+		go appexport.NewWorker(
+			exportRepo,
+			exportRepo,
+			exportStorage,
+			exportSigner,
+			log,
+			time.Duration(cfg.ExportDownloadTTLH)*time.Hour,
+			time.Duration(cfg.ExportWorkerPollS)*time.Second,
+		).Run(exportWorkerCtx)
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -408,6 +461,9 @@ func main() {
 	}
 
 	statsCancel()
+	if exportWorkerCancel != nil {
+		exportWorkerCancel()
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(),
 		time.Duration(cfg.APIShutdownTimeoutS)*time.Second)
 	defer cancel()

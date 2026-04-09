@@ -52,3 +52,4 @@ vendor/
 !certs/README.md
 
 .gocache
+exports/

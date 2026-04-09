@@ -65,10 +65,17 @@ type Config struct {
 
 	ShortCodeLength int
 	BaseURL         string
+	APIBaseURL      string
 
 	JWTIssuer        string
 	JWTAudience      string
 	JWTPublicKeyPath string
+
+	ExportStorageDir    string
+	ExportSignSecret    string
+	ExportDownloadTTLH  int
+	ExportWorkerPollS   int
+	ExportMaxWindowDays int
 }
 
 // Load reads all configuration from environment variables and validates them.
@@ -125,10 +132,17 @@ func Load() (*Config, error) {
 
 		ShortCodeLength: getEnvInt("SHORT_CODE_LENGTH", 7),
 		BaseURL:         getEnv("BASE_URL", "http://localhost:8081"),
+		APIBaseURL:      getEnv("API_BASE_URL", "http://localhost:8080"),
 
 		JWTIssuer:        getEnv("JWT_ISSUER", ""),
 		JWTAudience:      getEnv("JWT_AUDIENCE", ""),
 		JWTPublicKeyPath: getEnv("JWT_PUBLIC_KEY_PATH", ""),
+
+		ExportStorageDir:    getEnv("EXPORT_STORAGE_DIR", "./exports"),
+		ExportSignSecret:    getEnv("EXPORT_SIGN_SECRET", ""),
+		ExportDownloadTTLH:  getEnvInt("EXPORT_DOWNLOAD_TTL_H", 24),
+		ExportWorkerPollS:   getEnvInt("EXPORT_WORKER_POLL_S", 5),
+		ExportMaxWindowDays: getEnvInt("EXPORT_MAX_WINDOW_DAYS", 365),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -234,6 +248,12 @@ func (c *Config) validate() error {
 	validExporters := map[string]bool{"stdout": true, "otlp": true}
 	if c.OTelEnabled && !validExporters[c.OTelExporter] {
 		errs = append(errs, fmt.Sprintf("OTEL_EXPORTER must be one of: stdout, otlp (got: %q)", c.OTelExporter))
+	}
+	if c.ExportDownloadTTLH <= 0 {
+		errs = append(errs, "EXPORT_DOWNLOAD_TTL_H must be greater than 0")
+	}
+	if c.ExportWorkerPollS <= 0 {
+		errs = append(errs, "EXPORT_WORKER_POLL_S must be greater than 0")
 	}
 
 	if len(errs) > 0 {
