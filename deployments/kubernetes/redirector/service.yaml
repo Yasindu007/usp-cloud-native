@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: redirector
+  namespace: urlshortener
+  labels:
+    app: redirector
+spec:
+  selector:
+    app: redirector
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+  - name: metrics
+    port: 9091
+    targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redirector
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+    - urlshortener
+  selector:
+    matchLabels:
+      app: redirector
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redirector-config
+  namespace: urlshortener
+data:
+  SERVICE_NAME: redirect-service
+  REDIRECT_PORT: "8081"
+  REDIRECT_READ_TIMEOUT_S: "5"
+  REDIRECT_WRITE_TIMEOUT_S: "10"
+  REDIRECT_IDLE_TIMEOUT_S: "60"
+  REDIRECT_SHUTDOWN_TIMEOUT_S: "30"

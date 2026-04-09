@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: urlshortener
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: localhost:5001/urlshortener/migrate:latest
+        imagePullPolicy: IfNotPresent
+        args: ["up"]
+        env:
+        - name: CONFIG_DISABLE_DOTENV
+          value: "1"
+        - name: DB_PRIMARY_DSN
+          valueFrom:
+            secretKeyRef:
+              name: urlshortener-secrets
+              key: DB_PRIMARY_DSN

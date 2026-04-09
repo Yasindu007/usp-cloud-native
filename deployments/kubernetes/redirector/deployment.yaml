@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redirector
+  namespace: urlshortener
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: redirector
+  template:
+    metadata:
+      labels:
+        app: redirector
+    spec:
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: redirector
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: redirector
+        image: localhost:5001/urlshortener/redirector:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8081
+        - name: metrics
+          containerPort: 9091
+        envFrom:
+        - configMapRef:
+            name: app-config
+        - configMapRef:
+            name: redirector-config
+        env:
+        - name: DB_PRIMARY_DSN
+          valueFrom:
+            secretKeyRef:
+              name: urlshortener-secrets
+              key: DB_PRIMARY_DSN
+        - name: DB_REPLICA_DSN
+          valueFrom:
+            secretKeyRef:
+              name: urlshortener-secrets
+              key: DB_REPLICA_DSN
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: urlshortener-secrets
+              key: REDIS_PASSWORD
+        - name: IP_HASH_SALT
+          valueFrom:
+            secretKeyRef:
+              name: urlshortener-secrets
+              key: IP_HASH_SALT
+              optional: true
+        - name: METRICS_PORT
+          value: "9090"
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 20
+          periodSeconds: 20
+        startupProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          failureThreshold: 30
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi

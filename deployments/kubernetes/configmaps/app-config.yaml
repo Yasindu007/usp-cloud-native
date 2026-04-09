@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: urlshortener
+data:
+  ENVIRONMENT: "development"
+  CONFIG_DISABLE_DOTENV: "1"
+  DB_MAX_OPEN_CONNS: "25"
+  DB_MIN_OPEN_CONNS: "5"
+  DB_CONN_MAX_LIFETIME_M: "15"
+  DB_CONN_MAX_IDLE_TIME_M: "5"
+  REDIS_ADDR: "redis.urlshortener.svc.cluster.local:6379"
+  REDIS_DB: "0"
+  REDIS_POOL_SIZE: "10"
+  REDIS_MIN_IDLE_CONNS: "2"
+  REDIS_DIAL_TIMEOUT_S: "5"
+  REDIS_READ_TIMEOUT_S: "3"
+  REDIS_WRITE_TIMEOUT_S: "3"
+  REDIRECT_CACHE_TTL_S: "3600"
+  CACHE_NEGATIVE_TTL_S: "60"
+  OTEL_ENABLED: "false"
+  OTEL_EXPORTER: "stdout"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  SHORT_CODE_LENGTH: "7"
+  BASE_URL: "https://r.shortener.local"
+  API_BASE_URL: "https://api.shortener.local"
+  EXPORT_STORAGE_DIR: "/data/exports"
+  EXPORT_DOWNLOAD_TTL_H: "24"
+  EXPORT_WORKER_POLL_S: "5"
+  EXPORT_MAX_WINDOW_DAYS: "365"
+  WEBHOOK_WORKER_ENABLED: "true"
+  WEBHOOK_WORKER_BATCH_SIZE: "50"
+  WEBHOOK_WORKER_POLL_INTERVAL_S: "5"
+  WEBHOOK_WORKER_HTTP_TIMEOUT_S: "30"
