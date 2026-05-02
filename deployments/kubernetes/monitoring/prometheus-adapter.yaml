@@ -1,0 +1,26 @@
+# Helm values for prometheus-community/prometheus-adapter.
+# Install with:
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring -f deployments/kubernetes/monitoring/prometheus-adapter.yaml
+
+prometheus:
+  url: http://kube-prometheus-stack-prometheus.monitoring.svc
+  port: 9090
+  path: ""
+
+metricsRelistInterval: 30s
+
+rules:
+  custom:
+    - seriesQuery: 'urlshortener_http_requests_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "urlshortener_http_requests_total"
+        as: "http_requests_per_second"
+      metricsQuery: |
+        sum(rate(urlshortener_http_requests_total{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)

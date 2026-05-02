@@ -19,6 +19,7 @@ endif
 BUILD_DIR    := ./bin
 REGISTRY     := localhost:5001
 CLUSTER_NAME := urlshortener
+NAMESPACE    := urlshortener
 
 GIT_SHA  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
 GIT_TAG  := $(shell git describe --tags --always 2>/dev/null || echo "v0.0.0-dev")
@@ -31,7 +32,7 @@ LDFLAGS := -s -w \
 
 .PHONY: help
 help: ## Show available targets
-	@python -c "import pathlib,re; [print('\033[36m{:<28}\033[0m {}'.format(m.group(1), m.group(2))) for line in pathlib.Path('Makefile').read_text().splitlines() for m in [re.match(r'^([A-Za-z_-]+):.*?## (.*)$$', line)] if m]"
+	@python -c "import pathlib,re; [print('\033[36m{:<28}\033[0m {}'.format(m.group(1), m.group(2))) for line in pathlib.Path('Makefile').read_text().splitlines() for m in [re.match(r'^([A-Za-z0-9_-]+):.*?## (.*)$$', line)] if m]"
 
 .PHONY: build build-api build-redirector
 build: build-api build-redirector ## Build all service binaries locally
@@ -160,21 +161,68 @@ cluster-reset: cluster-down cluster-up ## Recreate the kind cluster
 verify: ## Verify registry, cluster, ingress, and metrics
 	$(SHELL) scripts/verify-cluster.sh
 
-.PHONY: deploy deploy-api deploy-redirector rollback
+.PHONY: secrets-generate secrets-seal secrets-list secrets-backup
+secrets-generate: ## Generate and apply SealedSecrets
+	$(SHELL) scripts/generate-secrets.sh
+
+secrets-seal: ## Encrypt one value with kubeseal
+	@read -p "Secret name: " SNAME; \
+	read -p "Key name: " KNAME; \
+	read -sp "Value: " SVAL; echo; \
+	$(SHELL) scripts/seal-secrets.sh "$$SNAME" "$$KNAME" "$$SVAL"
+
+secrets-list: ## List Kubernetes secrets
+	kubectl get secrets -n $(NAMESPACE)
+
+secrets-backup: ## Export the Sealed Secrets controller key
+	kubectl get secret -n kube-system \
+		-l sealedsecrets.bitnami.com/sealed-secrets-key \
+		-o yaml > sealing-key-backup-$(GIT_SHA).yaml
+	@echo "Sealing key backed up to sealing-key-backup-$(GIT_SHA).yaml"
+
+.PHONY: deploy deploy-api deploy-redirector rollback rollback-api rollback-redirector
 deploy: ## Deploy all services to Kubernetes
-	$(SHELL) scripts/deploy.sh
+	$(SHELL) scripts/deploy.sh --image-tag $(GIT_SHA)
 
-deploy-api: ## Restart api deployment
-	kubectl rollout restart deployment/api -n urlshortener
-	kubectl rollout status deployment/api -n urlshortener --timeout=5m
+deploy-api: ## Rolling update api-service image
+	kubectl set image deployment/api \
+		api=$(REGISTRY)/urlshortener/api:$(GIT_SHA) \
+		-n $(NAMESPACE)
+	kubectl rollout status deployment/api -n $(NAMESPACE) --timeout=5m
 
-deploy-redirector: ## Restart redirector deployment
-	kubectl rollout restart deployment/redirector -n urlshortener
-	kubectl rollout status deployment/redirector -n urlshortener --timeout=5m
+deploy-redirector: ## Rolling update redirector image
+	kubectl set image deployment/redirector \
+		redirector=$(REGISTRY)/urlshortener/redirector:$(GIT_SHA) \
+		-n $(NAMESPACE)
+	kubectl rollout status deployment/redirector -n $(NAMESPACE) --timeout=5m
 
 rollback: ## Roll back api and redirector deployments
-	kubectl rollout undo deployment/api -n urlshortener
-	kubectl rollout undo deployment/redirector -n urlshortener
+	kubectl rollout undo deployment/api -n $(NAMESPACE)
+	kubectl rollout undo deployment/redirector -n $(NAMESPACE)
+
+rollback-api: ## Roll back api deployment
+	kubectl rollout undo deployment/api -n $(NAMESPACE)
+
+rollback-redirector: ## Roll back redirector deployment
+	kubectl rollout undo deployment/redirector -n $(NAMESPACE)
+
+.PHONY: hpa-status pdb-status scale-status load-test-hpa
+hpa-status: ## Show HorizontalPodAutoscaler status
+	kubectl get hpa -n $(NAMESPACE)
+
+pdb-status: ## Show PodDisruptionBudget status
+	kubectl get pdb -n $(NAMESPACE)
+
+scale-status: ## Show pod counts and HPA state
+	@echo "==> Pods:"
+	@kubectl get pods -n $(NAMESPACE) -l 'app in (api,redirector)' --no-headers | awk '{print $$1, $$3}'
+	@echo ""
+	@echo "==> HPA:"
+	@kubectl get hpa -n $(NAMESPACE)
+
+load-test-hpa: ## Trigger redirector HPA scale-up with an in-cluster load test
+	@read -p "Short code to use (for example abc1234): " CODE; \
+	$(SHELL) scripts/load-test-hpa.sh "$$CODE" 120
 
 .PHONY: wso2-up wso2-down wso2-logs wso2-wait wso2-seed wso2-health wso2-reset wso2-shell
 wso2-up: ## Start WSO2 API Manager

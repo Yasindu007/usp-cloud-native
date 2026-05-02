@@ -10,10 +10,10 @@ metadata:
   namespace: urlshortener
 spec:
   hard:
-    requests.cpu: "4"
-    requests.memory: 4Gi
-    limits.cpu: "8"
-    limits.memory: 8Gi
+    requests.cpu: "6"
+    requests.memory: 6Gi
+    limits.cpu: "12"
+    limits.memory: 12Gi
     persistentvolumeclaims: "4"
     pods: "30"
 ---

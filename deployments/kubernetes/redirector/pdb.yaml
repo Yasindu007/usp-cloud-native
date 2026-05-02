@@ -3,6 +3,9 @@ kind: PodDisruptionBudget
 metadata:
   name: redirector-pdb
   namespace: urlshortener
+  labels:
+    app: redirector
+    component: availability
 spec:
   minAvailable: 2
   selector:

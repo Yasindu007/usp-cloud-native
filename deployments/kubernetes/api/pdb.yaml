@@ -3,8 +3,11 @@ kind: PodDisruptionBudget
 metadata:
   name: api-pdb
   namespace: urlshortener
+  labels:
+    app: api
+    component: availability
 spec:
-  minAvailable: 2
+  minAvailable: 1
   selector:
     matchLabels:
       app: api
