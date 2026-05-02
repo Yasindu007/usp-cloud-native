@@ -1,0 +1,135 @@
+# WSO2 API Manager - URL Shortener Management API
+name: URLShortener-API
+version: "1.0"
+context: /api/v1
+isDefaultVersion: true
+description: "URL Shortener Platform management API"
+type: HTTP
+transport:
+  - http
+  - https
+visibility: PUBLIC
+policies:
+  - Bronze
+  - Silver
+  - Gold
+securityScheme:
+  - oauth2
+  - api_key
+endpointConfig:
+  endpoint_type: http
+  production_endpoints:
+    url: "http://api.shortener.local/api/v1"
+    config:
+      actionDuration: "30000"
+      actionSelect: fault
+  sandbox_endpoints:
+    url: "http://api.shortener.local/api/v1"
+  endpoint_security:
+    production:
+      enabled: false
+    sandbox:
+      enabled: false
+operations:
+  - target: "/healthz"
+    verb: GET
+    authType: None
+    throttlingPolicy: Unlimited
+    scopes: []
+
+  - target: "/urls"
+    verb: POST
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces/{workspaceID}/urls"
+    verb: POST
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces/{workspaceID}/urls"
+    verb: GET
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [read]
+  - target: "/workspaces/{workspaceID}/urls/{urlID}"
+    verb: GET
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [read]
+  - target: "/workspaces/{workspaceID}/urls/{urlID}"
+    verb: PATCH
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces/{workspaceID}/urls/{urlID}"
+    verb: DELETE
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces"
+    verb: POST
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces"
+    verb: GET
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [read]
+  - target: "/workspaces/{workspaceID}"
+    verb: GET
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [read]
+  - target: "/workspaces/{workspaceID}/members"
+    verb: GET
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [read]
+  - target: "/workspaces/{workspaceID}/members"
+    verb: POST
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces/{workspaceID}/api-keys"
+    verb: GET
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [read]
+  - target: "/workspaces/{workspaceID}/api-keys"
+    verb: POST
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/workspaces/{workspaceID}/api-keys/{keyID}"
+    verb: DELETE
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+  - target: "/auth/token"
+    verb: DELETE
+    authType: Application
+    throttlingPolicy: Unlimited
+    scopes: [write]
+corsConfiguration:
+  corsConfigurationEnabled: true
+  accessControlAllowOrigins: ["*"]
+  accessControlAllowCredentials: false
+  accessControlAllowHeaders:
+    - authorization
+    - Access-Control-Allow-Origin
+    - Content-Type
+    - SOAPAction
+    - apikey
+  accessControlAllowMethods:
+    - GET
+    - PUT
+    - POST
+    - DELETE
+    - PATCH
+    - OPTIONS
+subscriptionAvailability: current_tenant
+subscriptionAvailableTenants: []
+monetization:
+  enabled: false

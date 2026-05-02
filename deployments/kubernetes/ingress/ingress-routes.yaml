@@ -1,53 +1,110 @@
+# ============================================================
+# NGINX Ingress routes - URL Shortener Platform
+#
+# WSO2 runs outside Kind and forwards traffic to these hostnames:
+#   api.shortener.local -> api service
+#   r.shortener.local   -> redirector service
+#
+# docker-compose.wso2.yml maps both hostnames to the Docker host, so WSO2
+# preserves the Host header that NGINX uses for routing.
+# ============================================================
+
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: urlshortener
+  name: urlshortener-api
   namespace: urlshortener
+  labels:
+    app: api
+    component: ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/enable-gzip: "true"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+    nginx.ingress.kubernetes.io/compute-full-forwarded-for: "true"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/enable-cors: "false"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.shortener.local
+      secretName: urlshortener-api-tls
+  rules:
+    - host: api.shortener.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: urlshortener-redirector
+  namespace: urlshortener
+  labels:
+    app: redirector
+    component: ingress
   annotations:
     kubernetes.io/ingress.class: nginx
     nginx.ingress.kubernetes.io/enable-gzip: "true"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "10"
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+    nginx.ingress.kubernetes.io/compute-full-forwarded-for: "true"
+    nginx.ingress.kubernetes.io/limit-connections: "500"
+    nginx.ingress.kubernetes.io/limit-rps: "1000"
 spec:
   ingressClassName: nginx
   tls:
-  - hosts:
-    - api.shortener.local
-    - r.shortener.local
-    secretName: urlshortener-tls
+    - hosts:
+        - r.shortener.local
+      secretName: urlshortener-redirector-tls
   rules:
-  - host: api.shortener.local
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: api
-            port:
-              number: 80
-  - host: r.shortener.local
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: redirector
-            port:
-              number: 80
+    - host: r.shortener.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: redirector
+                port:
+                  number: 80
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: urlshortener-tls
+  name: urlshortener-api-tls
   namespace: urlshortener
 spec:
-  secretName: urlshortener-tls
+  secretName: urlshortener-api-tls
   dnsNames:
-  - api.shortener.local
-  - r.shortener.local
+    - api.shortener.local
+  issuerRef:
+    name: urlshortener-issuer
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: urlshortener-redirector-tls
+  namespace: urlshortener
+spec:
+  secretName: urlshortener-redirector-tls
+  dnsNames:
+    - r.shortener.local
   issuerRef:
     name: urlshortener-issuer
     kind: Issuer

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Bootstrap the local Kind cluster and print the DNS/WSO2 steps needed for
+# the Story 4.3 gateway topology.
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,7 +21,7 @@ done
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
-need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1" >&2; exit 1; }; }
+need() { command -v "$1" >/dev/null 2>&1 || { printf 'missing required command: %s\n' "$1" >&2; exit 1; }; }
 
 for cmd in docker kubectl helm curl kind terraform; do
   need "$cmd"
@@ -59,6 +62,37 @@ deploy_platform() {
     warn "registry images are missing; skipping app deployments"
     warn "run scripts/build-images.sh && scripts/push-images.sh, then scripts/deploy.sh"
   fi
+}
+
+print_next_steps() {
+  cat <<EOF
+
+Kind cluster bootstrap complete.
+
+Cluster:  ${CLUSTER_NAME}
+Registry: http://${REGISTRY}
+Grafana:  http://localhost:30300
+
+Required local DNS entries for NGINX ingress and WSO2:
+  127.0.0.1 api.shortener.local r.shortener.local
+
+Linux/macOS:
+  echo '127.0.0.1 api.shortener.local r.shortener.local' | sudo tee -a /etc/hosts
+
+Windows:
+  Add the same line to:
+  C:\\Windows\\System32\\drivers\\etc\\hosts
+
+Verify ingress before starting WSO2:
+  curl http://api.shortener.local/healthz
+  curl http://r.shortener.local/healthz
+
+Start and seed WSO2 separately:
+  make wso2-up
+  make wso2-wait
+  make wso2-health
+  make wso2-seed
+EOF
 }
 
 log "Phase 1: ensuring local registry is running"
@@ -119,12 +153,10 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
 
 if [ "$SKIP_MANIFESTS" = "--skip-manifests" ]; then
   log "Skipping Kubernetes manifest application"
+  print_next_steps
   exit 0
 fi
 
 log "Phase 7: applying platform manifests"
 deploy_platform
-
-log "Kind cluster bootstrap complete"
-log "Registry: http://${REGISTRY}"
-log "Grafana: http://localhost:30300"
+print_next_steps

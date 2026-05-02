@@ -1,0 +1,145 @@
+# ============================================================
+# WSO2 API Manager 4.3.0 - local deployment.toml
+#
+# Keep this file intentionally conservative. The gateway routes to the local
+# Kind ingress through api.shortener.local and r.shortener.local, both mapped
+# to the Docker host in docker-compose.wso2.yml.
+# ============================================================
+
+[server]
+hostname = "localhost"
+base_path = "${carbon.protocol}://${carbon.host}:${carbon.management.port}"
+server_role = "default"
+
+[super_admin]
+username = "admin"
+password = "admin"
+create_admin_account = true
+
+[user_store]
+type = "database_unique_id"
+
+[database.apim_db]
+type = "h2"
+url = "jdbc:h2:./repository/database/WSO2AM_DB;DB_CLOSE_ON_EXIT=FALSE"
+username = "wso2carbon"
+password = "wso2carbon"
+
+[database.shared_db]
+type = "h2"
+url = "jdbc:h2:./repository/database/WSO2SHARED_DB;DB_CLOSE_ON_EXIT=FALSE"
+username = "wso2carbon"
+password = "wso2carbon"
+
+[database.local]
+url = "jdbc:h2:./repository/database/WSO2CARBON_DB;DB_CLOSE_ON_EXIT=FALSE"
+
+[keystore.tls]
+file_name = "wso2carbon.jks"
+type = "JKS"
+password = "wso2carbon"
+alias = "wso2carbon"
+key_password = "wso2carbon"
+
+[[apim.gateway.environment]]
+name = "Default"
+type = "hybrid"
+gateway_type = "Regular"
+provider = "wso2"
+display_in_api_console = true
+description = "URL Shortener local API gateway"
+show_as_token_endpoint_url = true
+service_url = "https://localhost:${mgt.transport.https.port}/services/"
+username = "${admin.username}"
+password = "${admin.password}"
+ws_endpoint = "ws://localhost:9099"
+wss_endpoint = "wss://localhost:8099"
+http_endpoint = "http://localhost:${http.nio.port}"
+https_endpoint = "https://localhost:${https.nio.port}"
+websub_event_receiver_http_endpoint = "http://localhost:9021"
+websub_event_receiver_https_endpoint = "https://localhost:8021"
+
+[apim.sync_runtime_artifacts.gateway]
+gateway_labels = ["Default"]
+
+[apim.key_manager]
+enable_apikey_subscription_validation = true
+enable_provisioned_app_validation = false
+
+[[apim.jwt.issuer]]
+name = "URLShortener-MockIssuer"
+issuer = "http://localhost:9000"
+alias = "urlshortener-mock"
+jwks_uri = "http://host.docker.internal:9000/.well-known/jwks.json"
+validate_subscription = false
+
+[[apim.jwt.issuer.claim_mapping]]
+remoteClaim = "workspace_id"
+localClaim = "http://wso2.org/claims/workspace_id"
+
+[[apim.jwt.issuer.claim_mapping]]
+remoteClaim = "scope"
+localClaim = "http://wso2.org/claims/scope"
+
+[apim.throttling]
+enable_data_publishing = false
+enable_policy_deploy = true
+enable_blacklist_condition = true
+
+[apim.throttling.jms]
+start_delay = "5000"
+
+[apim.cors]
+allow_origins = "*"
+allow_methods = ["GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS"]
+allow_headers = ["authorization", "Access-Control-Allow-Origin", "Content-Type", "SOAPAction", "apikey", "Internal-Key"]
+allow_credentials = false
+
+[apim.analytics]
+enable = false
+
+[apim.publisher]
+enable_portal_configuration_only_mode = false
+
+[apim.devportal]
+enable_key_provisioning = true
+enable_application_sharing = false
+enable_comments = true
+enable_ratings = true
+enable_forum = true
+
+[apim.cache.gateway_token_cache]
+enable = true
+expiry_time = "900s"
+
+[apim.cache.resource_cache]
+enable = true
+expiry_time = "900s"
+
+[apim.cache.jwt_claim_cache]
+enable = true
+expiry_time = "900s"
+
+[[event_handler]]
+name = "userPostSelfRegistration"
+subscriptions = ["POST_ADD_USER"]
+
+[service_provider]
+sp_name_regex = "^[\\sa-zA-Z0-9._-]*$"
+
+[[event_listener]]
+id = "token_revocation"
+type = "org.wso2.carbon.identity.core.handler.AbstractIdentityHandler"
+name = "org.wso2.is.notification.ApimOauthEventInterceptor"
+order = 1
+
+[event_listener.properties]
+notification_endpoint = "https://localhost:${mgt.transport.https.port}/internal/data/v1/notify"
+username = "${admin.username}"
+password = "${admin.password}"
+'header.X-WSO2-KEY-MANAGER' = "default"
+
+[oauth.grant_type.token_exchange]
+enable = true
+allow_refresh_tokens = true
+iat_validity_period = "1h"

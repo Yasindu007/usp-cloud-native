@@ -1,0 +1,36 @@
+# WSO2 API Manager - public redirect API
+name: URLShortener-Redirect-API
+version: "1.0"
+context: /r
+isDefaultVersion: true
+description: "URL Shortener public redirect service"
+type: HTTP
+transport:
+  - http
+  - https
+visibility: PUBLIC
+policies:
+  - Unlimited
+securityScheme: []
+endpointConfig:
+  endpoint_type: http
+  production_endpoints:
+    url: "http://r.shortener.local"
+    config:
+      actionDuration: "10000"
+      actionSelect: fault
+  sandbox_endpoints:
+    url: "http://r.shortener.local"
+  endpoint_security:
+    production:
+      enabled: false
+    sandbox:
+      enabled: false
+operations:
+  - target: "/{shortcode}"
+    verb: GET
+    authType: None
+    throttlingPolicy: Unlimited
+    scopes: []
+corsConfiguration:
+  corsConfigurationEnabled: false

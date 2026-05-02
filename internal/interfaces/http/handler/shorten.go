@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/urlshortener/platform/internal/application/apperrors"
@@ -169,7 +170,10 @@ func resolveIdentity(r *http.Request) (workspaceID, userID string) {
 	if claims, ok := domainauth.FromContext(r.Context()); ok {
 		return claims.WorkspaceID, claims.UserID
 	}
-	workspaceID = r.Header.Get("X-Workspace-ID")
+	workspaceID = chi.URLParam(r, "workspaceID")
+	if workspaceID == "" {
+		workspaceID = r.Header.Get("X-Workspace-ID")
+	}
 	if workspaceID == "" {
 		workspaceID = "ws_default"
 	}

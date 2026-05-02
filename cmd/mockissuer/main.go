@@ -35,6 +35,7 @@ package main
 import (
 	"context"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,16 +43,58 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/urlshortener/platform/pkg/jwtutil"
 )
+
+type registeredClient struct {
+	ClientID     string
+	ClientSecret string
+	ClientName   string
+	GrantTypes   []string
+}
+
+type clientRegistry struct {
+	mu      sync.RWMutex
+	clients map[string]registeredClient
+}
+
+func newClientRegistry() *clientRegistry {
+	registry := &clientRegistry{
+		clients: make(map[string]registeredClient),
+	}
+	registry.upsert(registeredClient{
+		ClientID:     "dev",
+		ClientSecret: "mock-secret",
+		ClientName:   "dev",
+		GrantTypes:   []string{"client_credentials"},
+	})
+	return registry
+}
+
+func (r *clientRegistry) upsert(client registeredClient) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clients[client.ClientID] = client
+}
+
+func (r *clientRegistry) get(clientID string) (registeredClient, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	client, ok := r.clients[clientID]
+	return client, ok
+}
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -63,6 +106,11 @@ func main() {
 	issuer := getEnv("JWT_ISSUER", "http://localhost:9000")
 	audience := getEnv("JWT_AUDIENCE", "url-shortener-api")
 	tokenTTL := 1 * time.Hour
+	jwksEndpoint := issuer + "/.well-known/jwks.json"
+	registrationEndpoint := issuer + "/oauth2/dcr/register"
+	tokenEndpoint := issuer + "/token"
+	introspectionEndpoint := issuer + "/oauth2/introspect"
+	revocationEndpoint := issuer + "/oauth2/revoke"
 
 	log.Info("starting mock JWT issuer",
 		slog.String("port", port),
@@ -125,6 +173,7 @@ func main() {
 
 	publicKeySet := jwk.NewSet()
 	_ = publicKeySet.AddKey(jwkKey)
+	clients := newClientRegistry()
 
 	// ── HTTP Routes ───────────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -148,11 +197,18 @@ func main() {
 			return
 		}
 
-		// In a real OAuth2 server, client_id and client_secret would be
-		// validated against a registry. For local dev, any non-empty values pass.
-		clientID := r.FormValue("client_id")
+		clientID, clientSecret := readClientCredentials(r)
 		if clientID == "" {
 			writeOAuthError(w, "invalid_client", "client_id is required")
+			return
+		}
+		client, ok := clients.get(clientID)
+		if !ok {
+			writeOAuthError(w, "invalid_client", "client_id is unknown")
+			return
+		}
+		if client.ClientSecret != "" && client.ClientSecret != clientSecret {
+			writeOAuthError(w, "invalid_client", "client_secret is invalid")
 			return
 		}
 
@@ -191,8 +247,11 @@ func main() {
 			return
 		}
 
-		// Sign with RS256 using the private key.
-		signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256, privateKey))
+		// Sign with RS256 using the private key and expose a stable kid so
+		// external JWT validators such as WSO2 can resolve the correct JWK.
+		headers := jws.NewHeaders()
+		_ = headers.Set("kid", "mock-key-1")
+		signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256, privateKey, jws.WithProtectedHeaders(headers)))
 		if err != nil {
 			log.Error("failed to sign token", slog.String("error", err.Error()))
 			http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -224,6 +283,103 @@ func main() {
 		_ = json.NewEncoder(w).Encode(publicKeySet)
 	})
 
+	oidcConfigHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                                issuer,
+			"registration_endpoint":                 registrationEndpoint,
+			"token_endpoint":                        tokenEndpoint,
+			"introspection_endpoint":                introspectionEndpoint,
+			"revocation_endpoint":                   revocationEndpoint,
+			"jwks_uri":                              jwksEndpoint,
+			"grant_types_supported":                 []string{"client_credentials"},
+			"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+			"response_types_supported":              []string{"token"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+			"scopes_supported":                      []string{"read", "write", "admin"},
+			"claims_supported":                      []string{"iss", "sub", "aud", "exp", "iat", "jti", "scope", "workspace_id", "client_id"},
+		})
+	}
+	mux.HandleFunc("/.well-known/openid-configuration", oidcConfigHandler)
+	mux.HandleFunc("/token/.well-known/openid-configuration", oidcConfigHandler)
+
+	mux.HandleFunc("/oauth2/dcr/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		client := registerClient(r, clients)
+		writeRegisteredClient(w, client)
+	})
+	mux.HandleFunc("/oauth2/dcr/register/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		encodedID := strings.TrimPrefix(r.URL.Path, "/oauth2/dcr/register/")
+		clientID := encodedID
+		if decoded, err := base64.RawURLEncoding.DecodeString(encodedID); err == nil && len(decoded) > 0 {
+			clientID = string(decoded)
+		} else if decoded, err := base64.StdEncoding.DecodeString(encodedID); err == nil && len(decoded) > 0 {
+			clientID = string(decoded)
+		}
+
+		client, ok := clients.get(clientID)
+		if !ok {
+			http.Error(w, "client not found", http.StatusNotFound)
+			return
+		}
+		writeRegisteredClient(w, client)
+	})
+
+	mux.HandleFunc("/oauth2/introspect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form body", http.StatusBadRequest)
+			return
+		}
+
+		token := r.FormValue("token")
+		if token == "" {
+			http.Error(w, "missing token", http.StatusBadRequest)
+			return
+		}
+
+		resp := map[string]any{"active": false}
+		parsed, err := jwt.Parse(
+			[]byte(token),
+			jwt.WithKeySet(publicKeySet, jwa.RS256),
+			jwt.WithValidate(true),
+			jwt.WithAudience(audience),
+			jwt.WithAcceptableSkew(30*time.Second),
+		)
+		if err == nil {
+			resp["active"] = true
+			resp["iss"] = parsed.Issuer()
+			resp["sub"] = parsed.Subject()
+			resp["scope"] = parsed.PrivateClaims()["scope"]
+			resp["client_id"] = parsed.PrivateClaims()["client_id"]
+			resp["workspace_id"] = parsed.PrivateClaims()["workspace_id"]
+			resp["exp"] = parsed.Expiration().Unix()
+			resp["iat"] = parsed.IssuedAt().Unix()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("/oauth2/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
 	// GET /healthz
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -231,9 +387,18 @@ func main() {
 	})
 
 	// ── HTTP Server ───────────────────────────────────────────────────────────
+	loggedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Debug("request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("remote_addr", r.RemoteAddr),
+		)
+		mux.ServeHTTP(w, r)
+	})
+
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      loggedMux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -244,6 +409,7 @@ func main() {
 			slog.String("addr", srv.Addr),
 			slog.String("token_endpoint", fmt.Sprintf("http://localhost:%s/token", port)),
 			slog.String("jwks_endpoint", fmt.Sprintf("http://localhost:%s/.well-known/jwks.json", port)),
+			slog.String("openid_configuration", fmt.Sprintf("http://localhost:%s/.well-known/openid-configuration", port)),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
@@ -273,6 +439,93 @@ func writeOAuthError(w http.ResponseWriter, code, description string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"error":             code,
 		"error_description": description,
+	})
+}
+
+func readClientCredentials(r *http.Request) (string, string) {
+	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
+
+	if user, pass, ok := r.BasicAuth(); ok {
+		if clientID == "" {
+			clientID = user
+		}
+		if clientSecret == "" {
+			clientSecret = pass
+		}
+	}
+
+	return clientID, clientSecret
+}
+
+func registerClient(r *http.Request, registry *clientRegistry) registeredClient {
+	payload := struct {
+		ClientName string   `json:"clientName"`
+		ClientID   string   `json:"clientId"`
+		GrantTypes []string `json:"grantType"`
+	}{}
+
+	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+	} else if err := r.ParseForm(); err == nil {
+		payload.ClientName = r.FormValue("clientName")
+		payload.ClientID = r.FormValue("clientId")
+		if grantType := r.FormValue("grantType"); grantType != "" {
+			payload.GrantTypes = strings.Fields(strings.ReplaceAll(grantType, ",", " "))
+		}
+	}
+
+	clientID := payload.ClientID
+	if clientID == "" {
+		clientID = "mock-" + strings.ToLower(ulid.Make().String())
+	}
+	clientName := payload.ClientName
+	if clientName == "" {
+		clientName = clientID
+	}
+	grantTypes := payload.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"client_credentials"}
+	}
+
+	client := registeredClient{
+		ClientID:     clientID,
+		ClientSecret: "secret-" + strings.ToLower(ulid.Make().String()),
+		ClientName:   clientName,
+		GrantTypes:   uniqueGrantTypes(grantTypes),
+	}
+	registry.upsert(client)
+	return client
+}
+
+func uniqueGrantTypes(grantTypes []string) []string {
+	unique := make([]string, 0, len(grantTypes))
+	for _, grantType := range grantTypes {
+		grantType = strings.TrimSpace(grantType)
+		if grantType == "" || slices.Contains(unique, grantType) {
+			continue
+		}
+		unique = append(unique, grantType)
+	}
+	if len(unique) == 0 {
+		return []string{"client_credentials"}
+	}
+	return unique
+}
+
+func writeRegisteredClient(w http.ResponseWriter, client registeredClient) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"clientId":          client.ClientID,
+		"clientName":        client.ClientName,
+		"callBackURL":       nil,
+		"clientSecret":      client.ClientSecret,
+		"isSaasApplication": true,
+		"appOwner":          "admin",
+		"jsonString":        fmt.Sprintf(`{"grant_types":"%s","redirect_uris":null,"client_name":"%s"}`, strings.Join(client.GrantTypes, " "), client.ClientName),
+		"jsonAppAttribute":  "{}",
+		"applicationUUID":   nil,
+		"tokenType":         "DEFAULT",
 	})
 }
 

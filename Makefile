@@ -176,6 +176,55 @@ rollback: ## Roll back api and redirector deployments
 	kubectl rollout undo deployment/api -n urlshortener
 	kubectl rollout undo deployment/redirector -n urlshortener
 
+.PHONY: wso2-up wso2-down wso2-logs wso2-wait wso2-seed wso2-health wso2-reset wso2-shell
+wso2-up: ## Start WSO2 API Manager
+	docker compose -f docker-compose.wso2.yml up -d
+	@echo "WSO2 starting; first boot usually takes 2-3 minutes"
+	@echo "Monitor with: docker logs urlshortener-wso2 -f"
+
+wso2-down: ## Stop WSO2 API Manager
+	docker compose -f docker-compose.wso2.yml down
+
+wso2-logs: ## Tail WSO2 logs
+	docker logs urlshortener-wso2 -f
+
+wso2-wait: ## Wait until WSO2 is ready
+	@echo "Waiting for WSO2 to be ready..."
+	@until curl -sk https://localhost:9443/services/Version | grep -qi version; do \
+		echo -n "."; sleep 10; \
+	done
+	@echo ""
+	@echo "WSO2 is ready"
+
+wso2-seed: ## Import URL Shortener APIs into WSO2
+	$(SHELL) scripts/seed-wso2.sh
+
+wso2-health: ## Check WSO2 health and ingress reachability
+	$(SHELL) scripts/wso2-health.sh
+
+wso2-reset: ## Reconcile WSO2 APIs and recreate the dev app/subscriptions
+	$(SHELL) scripts/seed-wso2.sh --reset
+
+wso2-shell: ## Open a shell inside the WSO2 container
+	docker exec -it urlshortener-wso2 /bin/bash
+
+.PHONY: setup-hosts
+setup-hosts: ## Add required local ingress hostnames to /etc/hosts
+ifeq ($(OS),Windows_NT)
+	@echo "Add this line to C:\\Windows\\System32\\drivers\\etc\\hosts as Administrator:"
+	@echo "127.0.0.1 api.shortener.local r.shortener.local"
+else
+	@if ! grep -q "api.shortener.local" /etc/hosts; then \
+		echo "127.0.0.1 api.shortener.local r.shortener.local" | sudo tee -a /etc/hosts; \
+		echo "Added DNS entries"; \
+	else \
+		echo "DNS entries already present"; \
+	fi
+endif
+
+.PHONY: wso2-start
+wso2-start: wso2-up wso2-wait wso2-seed ## Start WSO2 and seed APIs
+
 .PHONY: bootstrap full-deploy clean
 bootstrap: registry-up cluster-up ## Start registry and bootstrap cluster
 

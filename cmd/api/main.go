@@ -290,7 +290,15 @@ func main() {
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "alive"})
 	})
+	r.Get("/api/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+		response.JSON(w, http.StatusOK, map[string]string{"status": "alive"})
+	})
 	r.Get("/readyz", readyHandler(log, dbClient, redisClient))
+	if shortenUseCase != nil {
+		r.With(rlWrite, auditOf(domainaudit.ActionURLCreate)).
+			Post("/api/v1/workspaces/{workspaceID}/urls", handler.NewShortenHandler(shortenUseCase, log, appMetrics).
+				WithWebhookDispatcher(webhookDispatcher).Handle)
+	}
 	if exportRepo != nil {
 		exportH := handler.NewExportHandler(nil, nil, exportRepo, exportStorage, exportSigner, cfg.APIBaseURL, log)
 		r.Get("/api/v1/exports/{exportID}/download", exportH.Download)

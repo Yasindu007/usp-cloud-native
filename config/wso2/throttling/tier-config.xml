@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WSO2 custom throttling tiers for local development.
+
+  WSO2 subscription throttling protects the gateway per subscribed app.
+  The platform's Redis token bucket still performs per-user/IP limiting
+  inside the services.
+-->
+<throttle xmlns="http://www.wso2.org/throttle/policy">
+  <tier>
+    <name>Bronze</name>
+    <description>Free tier: 1,000 requests per minute.</description>
+    <properties>
+      <property name="RequestCount">1000</property>
+      <property name="UnitTime">60000</property>
+      <property name="TierPlan">FREE</property>
+      <property name="StopOnQuotaReach">true</property>
+      <property name="BillingPlan">FREE</property>
+    </properties>
+    <allowed>true</allowed>
+  </tier>
+  <tier>
+    <name>Silver</name>
+    <description>Pro tier: 5,000 requests per minute.</description>
+    <properties>
+      <property name="RequestCount">5000</property>
+      <property name="UnitTime">60000</property>
+      <property name="TierPlan">COMMERCIAL</property>
+      <property name="StopOnQuotaReach">true</property>
+      <property name="BillingPlan">COMMERCIAL</property>
+    </properties>
+    <allowed>true</allowed>
+  </tier>
+  <tier>
+    <name>Gold</name>
+    <description>Enterprise tier: 20,000 requests per minute.</description>
+    <properties>
+      <property name="RequestCount">20000</property>
+      <property name="UnitTime">60000</property>
+      <property name="TierPlan">COMMERCIAL</property>
+      <property name="StopOnQuotaReach">true</property>
+      <property name="BillingPlan">COMMERCIAL</property>
+    </properties>
+    <allowed>true</allowed>
+  </tier>
+  <tier>
+    <name>Unlimited</name>
+    <description>No WSO2-level throttling. Redirect service rate limits internally.</description>
+    <properties>
+      <property name="RequestCount">-1</property>
+      <property name="UnitTime">-1</property>
+      <property name="TierPlan">FREE</property>
+      <property name="StopOnQuotaReach">false</property>
+      <property name="BillingPlan">FREE</property>
+    </properties>
+    <allowed>true</allowed>
+  </tier>
+</throttle>

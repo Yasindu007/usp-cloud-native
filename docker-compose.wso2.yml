@@ -1,0 +1,63 @@
+# ============================================================
+# WSO2 API Manager - Local Development
+#
+# WSO2 API Manager runs outside the Kind cluster and forwards API traffic to
+# the host-mounted NGINX ingress listener. The API endpoint URLs use the same
+# hostnames as the ingress rules so NGINX receives the correct Host header.
+#
+# Ports:
+#   8280 - HTTP API gateway
+#   8243 - HTTPS API gateway
+#   9443 - Publisher, Developer Portal, Admin Console
+#
+# Default portals:
+#   https://localhost:9443/publisher   admin/admin
+#   https://localhost:9443/devportal   admin/admin
+#   https://localhost:9443/carbon      admin/admin
+# ============================================================
+
+services:
+  wso2am:
+    image: wso2/wso2am:4.3.0
+    container_name: urlshortener-wso2
+    restart: unless-stopped
+    environment:
+      JAVA_OPTS: >-
+        -Xms512m
+        -Xmx1536m
+        -XX:+UseG1GC
+        -XX:MaxGCPauseMillis=200
+        -Dfile.encoding=UTF8
+    ports:
+      - "8280:8280"
+      - "8243:8243"
+      - "9443:9443"
+    volumes:
+      - ./config/wso2/deployment.toml:/home/wso2carbon/wso2am-4.3.0/repository/conf/deployment.toml:ro
+      - wso2_data:/home/wso2carbon/wso2am-4.3.0/repository/database
+      - wso2_deployment:/home/wso2carbon/wso2am-4.3.0/repository/deployment/server
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "api.shortener.local:host-gateway"
+      - "r.shortener.local:host-gateway"
+    networks:
+      - wso2-net
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -skf https://localhost:9443/services/Version >/dev/null"
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+
+volumes:
+  wso2_data:
+    driver: local
+  wso2_deployment:
+    driver: local
+
+networks:
+  wso2-net:
+    driver: bridge
+    name: urlshortener-wso2
