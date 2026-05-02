@@ -66,9 +66,15 @@ gateway_labels = ["Default"]
 enable_apikey_subscription_validation = true
 enable_provisioned_app_validation = false
 
+[apim.jwt]
+enable = true
+header = "X-JWT-Assertion"
+encoding = "base64url"
+use_kid_property = true
+
 [[apim.jwt.issuer]]
-name = "URLShortener-MockIssuer"
-issuer = "http://localhost:9000"
+name = "mock-issuer"
+issuer = "http://host.docker.internal:9000"
 alias = "urlshortener-mock"
 jwks_uri = "http://host.docker.internal:9000/.well-known/jwks.json"
 validate_subscription = false
@@ -108,15 +114,14 @@ enable_comments = true
 enable_ratings = true
 enable_forum = true
 
-[apim.cache.gateway_token_cache]
+[apim.cache.gateway_token]
+enable = false
+
+[apim.cache.resource]
 enable = true
 expiry_time = "900s"
 
-[apim.cache.resource_cache]
-enable = true
-expiry_time = "900s"
-
-[apim.cache.jwt_claim_cache]
+[apim.cache.jwt_claim]
 enable = true
 expiry_time = "900s"
 

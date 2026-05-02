@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -120,6 +121,15 @@ func main() {
 		ac := httpmiddleware.AuthConfig{
 			Issuer: cfg.JWTIssuer, Audience: cfg.JWTAudience,
 			KeySet: keySet, Log: log,
+			AllowedIssuers: splitCSV(cfg.JWTAllowedIssuers),
+		}
+		if cfg.JWTAdditionalPublicKeyPath != "" {
+			additionalKeySet, err := jwtutil.LoadPublicKeyAsJWKSet(cfg.JWTAdditionalPublicKeyPath)
+			if err != nil {
+				log.Error("additional jwt key load failed", slog.String("error", err.Error()))
+				os.Exit(1)
+			}
+			ac.AdditionalKeySet = additionalKeySet
 		}
 		if redisClient != nil {
 			ac.DenyList = infraauth.NewDenyList(redisClient.RDB())
@@ -613,4 +623,18 @@ func collectPoolStats(ctx context.Context, m *metrics.Metrics, db *postgres.Clie
 			}
 		}
 	}
+}
+
+func splitCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

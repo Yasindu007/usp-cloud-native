@@ -67,9 +67,11 @@ type Config struct {
 	BaseURL         string
 	APIBaseURL      string
 
-	JWTIssuer        string
-	JWTAudience      string
-	JWTPublicKeyPath string
+	JWTIssuer                  string
+	JWTAudience                string
+	JWTPublicKeyPath           string
+	JWTAllowedIssuers          string
+	JWTAdditionalPublicKeyPath string
 
 	ExportStorageDir    string
 	ExportSignSecret    string
@@ -139,9 +141,11 @@ func Load() (*Config, error) {
 		BaseURL:         getEnv("BASE_URL", "http://localhost:8081"),
 		APIBaseURL:      getEnv("API_BASE_URL", "http://localhost:8080"),
 
-		JWTIssuer:        getEnv("JWT_ISSUER", ""),
-		JWTAudience:      getEnv("JWT_AUDIENCE", ""),
-		JWTPublicKeyPath: getEnv("JWT_PUBLIC_KEY_PATH", ""),
+		JWTIssuer:                  getEnv("JWT_ISSUER", ""),
+		JWTAudience:                getEnv("JWT_AUDIENCE", ""),
+		JWTPublicKeyPath:           getEnv("JWT_PUBLIC_KEY_PATH", ""),
+		JWTAllowedIssuers:          getEnv("JWT_ALLOWED_ISSUERS", ""),
+		JWTAdditionalPublicKeyPath: getEnv("JWT_ADDITIONAL_PUBLIC_KEY_PATH", ""),
 
 		ExportStorageDir:    getEnv("EXPORT_STORAGE_DIR", "./exports"),
 		ExportSignSecret:    getEnv("EXPORT_SIGN_SECRET", ""),

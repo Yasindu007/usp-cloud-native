@@ -9,6 +9,7 @@ transport:
   - http
   - https
 visibility: PUBLIC
+apiKeyHeader: X-API-Key
 policies:
   - Bronze
   - Silver

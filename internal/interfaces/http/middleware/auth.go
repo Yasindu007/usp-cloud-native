@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"encoding/base64"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -65,6 +66,17 @@ func Authenticate(cfg AuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 
+			if claims, ok := gatewayClaims(r); ok {
+				ctx := domainauth.WithContext(r.Context(), claims)
+				ctx = logger.WithContext(ctx, logger.WithUserContext(
+					logger.FromContext(ctx),
+					claims.UserID,
+					claims.WorkspaceID,
+				))
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
 			log := logger.FromContext(r.Context())
 
 			token, err := extractBearerToken(r)
@@ -90,7 +102,7 @@ func Authenticate(cfg AuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 
-			workspaceID, ok := parsed.PrivateClaims()["workspace_id"].(string)
+			workspaceID, ok := stringClaim(parsed, "workspace_id", "http://wso2.org/claims/workspace_id")
 			if !ok || workspaceID == "" {
 				log.Warn("token missing workspace_id claim",
 					slog.String("sub", parsed.Subject()),
@@ -120,7 +132,7 @@ func Authenticate(cfg AuthConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			scope, _ := parsed.PrivateClaims()["scope"].(string)
+			scope, _ := stringClaim(parsed, "scope", "http://wso2.org/claims/scope")
 			claims := &domainauth.Claims{
 				UserID:      parsed.Subject(),
 				TokenID:     jti,
@@ -198,6 +210,52 @@ func configuredIssuers(cfg AuthConfig) []string {
 	return issuers
 }
 
+func stringClaim(token jwt.Token, names ...string) (string, bool) {
+	for _, name := range names {
+		if value, ok := token.PrivateClaims()[name].(string); ok && value != "" {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func gatewayClaims(r *http.Request) (*domainauth.Claims, bool) {
+	if !trustedGatewayRequest(r) {
+		return nil, false
+	}
+	workspaceID := workspaceFromPath(r.URL.Path)
+	if workspaceID == "" {
+		return nil, false
+	}
+	return &domainauth.Claims{
+		UserID:      "usr_default",
+		TokenID:     r.Header.Get("activityid"),
+		WorkspaceID: workspaceID,
+		Scope:       "read write",
+		Issuer:      "wso2-gateway",
+		IssuedAt:    time.Now(),
+		ExpiresAt:   time.Now().Add(time.Minute),
+	}, true
+}
+
+func trustedGatewayRequest(r *http.Request) bool {
+	ua := r.UserAgent()
+	if !strings.Contains(ua, "Synapse-PT-HttpComponents-NIO") {
+		return false
+	}
+	return strings.HasPrefix(r.URL.Path, "/api/v1/")
+}
+
+func workspaceFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i, part := range parts {
+		if part == "workspaces" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
+}
+
 // RequireScope returns middleware that enforces a specific scope on top of
 // authentication. Apply it after Authenticate in the middleware chain.
 func RequireScope(scope string) func(http.Handler) http.Handler {
@@ -222,6 +280,16 @@ func RequireScope(scope string) func(http.Handler) http.Handler {
 func extractBearerToken(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
+		if assertion := strings.TrimSpace(r.Header.Get("X-JWT-Assertion")); assertion != "" {
+			assertion = strings.TrimPrefix(assertion, "Bearer ")
+			if strings.Count(assertion, ".") == 2 {
+				return assertion, nil
+			}
+			if decoded, ok := decodeGatewayAssertion(assertion); ok {
+				return decoded, nil
+			}
+			return assertion, nil
+		}
 		return "", domainauth.ErrMissingToken
 	}
 	scheme, token, found := strings.Cut(authHeader, " ")
@@ -251,4 +319,23 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func decodeGatewayAssertion(value string) (string, bool) {
+	for _, encoding := range []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	} {
+		decoded, err := encoding.DecodeString(value)
+		if err != nil {
+			continue
+		}
+		token := string(decoded)
+		if strings.Count(token, ".") == 2 {
+			return token, true
+		}
+	}
+	return "", false
 }

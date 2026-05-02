@@ -78,8 +78,27 @@ func LoadPublicKeyAsJWKSet(path string) (jwk.Set, error) {
 		return nil, fmt.Errorf("jwtutil: reading public key file %q: %w", path, err)
 	}
 
-	// jwk.ParseKey handles PEM-encoded RSA public keys directly.
-	key, err := jwk.ParseKey(data, jwk.WithPEM(true))
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("jwtutil: no PEM block found in %q", path)
+	}
+
+	var source any = data
+	if block.Type == "CERTIFICATE" {
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("jwtutil: parsing certificate from %q: %w", path, err)
+		}
+		source = cert.PublicKey
+	}
+
+	var key jwk.Key
+	if block.Type == "CERTIFICATE" {
+		key, err = jwk.FromRaw(source)
+	} else {
+		// jwk.ParseKey handles PEM-encoded RSA public keys directly.
+		key, err = jwk.ParseKey(data, jwk.WithPEM(true))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("jwtutil: parsing public key from %q: %w", path, err)
 	}

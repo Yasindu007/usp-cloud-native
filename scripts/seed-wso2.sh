@@ -36,8 +36,8 @@ WSO2_PASS = os.environ.get("WSO2_PASS", "admin")
 API_BACKEND_URL = os.environ.get("API_BACKEND_URL", "http://api.shortener.local/api/v1")
 REDIRECT_BACKEND_URL = os.environ.get("REDIRECT_BACKEND_URL", "http://r.shortener.local")
 MOCK_ISSUER_URL = os.environ.get("MOCK_ISSUER_URL", "http://127.0.0.1:9000").rstrip("/")
-MOCK_ISSUER_PUBLIC_URL = os.environ.get("MOCK_ISSUER_PUBLIC_URL", "http://localhost:9000").rstrip("/")
-MOCK_KEY_MANAGER_NAME = os.environ.get("MOCK_KEY_MANAGER_NAME", "URLShortener-MockIssuer")
+MOCK_ISSUER_PUBLIC_URL = os.environ.get("MOCK_ISSUER_PUBLIC_URL", "http://host.docker.internal:9000").rstrip("/")
+MOCK_KEY_MANAGER_NAME = os.environ.get("MOCK_KEY_MANAGER_NAME", "mock-issuer")
 RESET = len(sys.argv) > 1 and sys.argv[1] == "--reset"
 CTX = ssl._create_unverified_context()
 WINDOWS_CURL = shutil.which("curl.exe")
@@ -227,6 +227,7 @@ def api_payload():
         "policies": ["Bronze", "Silver", "Gold"],
         "visibility": "PUBLIC",
         "securityScheme": ["oauth2", "api_key"],
+        "apiKeyHeader": "X-API-Key",
         "endpointConfig": {
             "endpoint_type": "http",
             "production_endpoints": {
@@ -261,7 +262,7 @@ def api_payload():
             "corsConfigurationEnabled": True,
             "accessControlAllowOrigins": ["*"],
             "accessControlAllowCredentials": False,
-            "accessControlAllowHeaders": ["authorization", "Access-Control-Allow-Origin", "Content-Type", "SOAPAction", "apikey"],
+            "accessControlAllowHeaders": ["authorization", "Access-Control-Allow-Origin", "Content-Type", "SOAPAction", "apikey", "ApiKey", "X-API-Key"],
             "accessControlAllowMethods": ["GET", "PUT", "POST", "DELETE", "PATCH", "OPTIONS"],
         },
     }
@@ -648,6 +649,11 @@ def ensure_mock_key_manager():
 
 
 def create_mock_client(app_id):
+    stable_client_id = os.environ.get("MOCK_ISSUER_CLIENT_ID", "dev")
+    stable_client_secret = os.environ.get("MOCK_ISSUER_CLIENT_SECRET", "mock-secret")
+    if stable_client_id and stable_client_secret:
+        return {"clientId": stable_client_id, "clientSecret": stable_client_secret}
+
     status, body = mock_request(
         "POST",
         "/oauth2/dcr/register",
@@ -661,21 +667,33 @@ def create_mock_client(app_id):
 
 
 def map_mock_keys(app_id, client_id, client_secret):
-    status, body = devportal(
-        "POST",
-        f"/applications/{app_id}/map-keys",
-        {
-            "consumerKey": client_id,
-            "consumerSecret": client_secret,
-            "keyManager": MOCK_KEY_MANAGER_NAME,
-            "keyType": "PRODUCTION",
-        },
-        allow_error=True,
-    )
-    if status not in (200, 201):
-        warn(f"Mapping external mock keys failed: HTTP {status} {body}")
-        return {}
-    return parse_json_response(status, body, "Map external keys")
+    payload = {
+        "consumerKey": client_id,
+        "consumerSecret": client_secret,
+        "keyManager": MOCK_KEY_MANAGER_NAME,
+        "keyType": "PRODUCTION",
+    }
+    last_status = 0
+    last_body = ""
+    for attempt in range(1, 7):
+        status, body = devportal("POST", f"/applications/{app_id}/map-keys", payload, allow_error=True)
+        if status in (200, 201):
+            return parse_json_response(status, body, "Map external keys")
+        if status == 409 or "already" in body.lower():
+            return {
+                "keyManager": MOCK_KEY_MANAGER_NAME,
+                "consumerKey": client_id,
+                "consumerSecret": client_secret,
+            }
+        last_status = status
+        last_body = body
+        if "key manager not registered" in body.lower() and attempt < 6:
+            time.sleep(5)
+            continue
+        break
+
+    warn(f"Mapping external mock keys failed: HTTP {last_status} {last_body}")
+    return {}
 
 
 def provision_mock_keys(app_id):
