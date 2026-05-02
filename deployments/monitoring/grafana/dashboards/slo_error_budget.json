@@ -1,0 +1,136 @@
+{
+  "title": "SLO Error Budget Tracker",
+  "uid": "slo-error-budget",
+  "description": "30-day rolling error budget consumption and burn rate. Source of truth for deployment go/no-go decisions.",
+  "tags": ["slo", "error-budget", "sre"],
+  "schemaVersion": 38,
+  "refresh": "1m",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Redirect Error Budget Remaining",
+      "description": "SLO-01: 99.95% availability = 21.6 min budget per 30 days",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "red", "value": null },
+            { "color": "yellow", "value": 0.25 },
+            { "color": "green", "value": 0.50 }
+          ]},
+          "min": 0, "max": 1
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto" },
+      "targets": [{
+        "expr": "1 - (sum(increase(urlshortener_http_requests_total{service=\"redirect-service\",status_code=~\"5..\"}[30d])) / sum(increase(urlshortener_http_requests_total{service=\"redirect-service\"}[30d]))) / (1 - 0.9995)",
+        "instant": true,
+        "legendFormat": "Budget remaining"
+      }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "API Error Budget Remaining",
+      "description": "SLO-02: 99.9% availability = 43.2 min budget per 30 days",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "red", "value": null },
+            { "color": "yellow", "value": 0.25 },
+            { "color": "green", "value": 0.50 }
+          ]},
+          "min": 0, "max": 1
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "expr": "1 - (sum(increase(urlshortener_http_requests_total{service=\"api-service\",status_code=~\"5..\"}[30d])) / sum(increase(urlshortener_http_requests_total{service=\"api-service\"}[30d]))) / (1 - 0.999)",
+        "instant": true,
+        "legendFormat": "Budget remaining"
+      }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Current Burn Rate (1h)",
+      "description": "How fast is the error budget being consumed? >14.4× = page now",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 6 },
+            { "color": "red", "value": 14.4 }
+          ]}
+        }
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "expr": "slo:redirect_error_ratio:rate1h / 0.0005",
+        "instant": true,
+        "legendFormat": "Burn rate"
+      }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Cache Hit Ratio (5m)",
+      "description": "SLO-05: target > 85%",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "red", "value": null },
+            { "color": "yellow", "value": 0.80 },
+            { "color": "green", "value": 0.85 }
+          ]},
+          "min": 0, "max": 1
+        }
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "expr": "slo:cache_hit_ratio:rate5m",
+        "instant": true,
+        "legendFormat": "Cache hit %"
+      }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Error Budget Burn Rate — Multi-window (30d view)",
+      "description": "Green=normal (1×). Yellow=slow burn (6×). Red=fast burn (14.4×) — page on-call.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 5 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "5m burn" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" }}] },
+          { "matcher": { "id": "byName", "options": "1h burn" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" }}] }
+        ]
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"] } },
+      "targets": [
+        { "expr": "slo:redirect_error_ratio:rate5m / 0.0005", "legendFormat": "5m burn" },
+        { "expr": "slo:redirect_error_ratio:rate1h / 0.0005", "legendFormat": "1h burn" },
+        { "expr": "slo:redirect_error_ratio:rate6h / 0.0005", "legendFormat": "6h burn" }
+      ]
+    }
+  ],
+  "version": 1
+}

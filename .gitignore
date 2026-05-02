@@ -13,6 +13,10 @@
 *.test
 coverage.out
 coverage.html
+tests/load/results/*.json
+tests/load/results/*.html
+!tests/load/results/.gitkeep
+.tmp-*-load.log
 
 # Build cache
 /tmp/

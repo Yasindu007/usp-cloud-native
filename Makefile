@@ -246,6 +246,46 @@ load-test-hpa: ## Trigger redirector HPA scale-up with an in-cluster load test
 	@read -p "Short code to use (for example abc1234): " CODE; \
 	$(SHELL) scripts/load-test-hpa.sh "$$CODE" 120
 
+.PHONY: load-test load-seed load-redirect load-shorten load-spike load-soak load-stress load-slo load-stack-up load-stack-down slo-report slo-report-json
+load-stack-up: ## Start InfluxDB and Grafana for k6 load-test observability
+	docker compose -f docker-compose.k6.yml up -d
+	@echo "InfluxDB: http://localhost:8086"
+	@echo "Grafana:  http://localhost:3001 (admin/admin)"
+
+load-stack-down: ## Stop the k6 observability stack
+	docker compose -f docker-compose.k6.yml down
+
+load-seed: ## Seed test short codes required before redirect tests
+	$(SHELL) -lc "mkdir -p tests/load/results"
+	$(SHELL) scripts/run-load-test.sh --seed
+
+load-redirect: load-seed load-stack-up ## Run redirect baseline test (SLO gate: P99 < 50ms)
+	$(SHELL) scripts/run-load-test.sh redirect_baseline
+
+load-shorten: load-seed load-stack-up ## Run shorten baseline test (SLO gate: P99 < 200ms)
+	$(SHELL) scripts/run-load-test.sh shorten_baseline
+
+load-spike: load-seed load-stack-up ## Run viral spike simulation
+	$(SHELL) scripts/run-load-test.sh spike_test
+
+load-soak: load-seed load-stack-up ## Run 30-minute soak test
+	$(SHELL) scripts/run-load-test.sh soak_test
+
+load-stress: load-seed load-stack-up ## Run stress test to find capacity limits
+	$(SHELL) scripts/run-load-test.sh stress_test
+
+load-slo: load-seed load-stack-up ## Run full SLO validation test
+	$(SHELL) scripts/run-load-test.sh slo_validation
+
+load-test: load-seed load-stack-up ## Run redirect, shorten, and spike scenarios
+	$(SHELL) scripts/run-load-test.sh --all
+
+slo-report: ## Query Prometheus and print SLO status report
+	$(SHELL) scripts/slo-report.sh
+
+slo-report-json: ## Output SLO report as machine-readable JSON
+	$(SHELL) scripts/slo-report.sh --json
+
 .PHONY: wso2-up wso2-down wso2-logs wso2-wait wso2-seed wso2-health wso2-reset wso2-shell
 wso2-up: ## Start WSO2 API Manager
 	docker compose -f docker-compose.wso2.yml up -d
@@ -295,7 +335,7 @@ endif
 .PHONY: wso2-start
 wso2-start: wso2-up wso2-wait wso2-seed ## Start WSO2 and seed APIs
 
-.PHONY: bootstrap full-deploy ci-local clean
+.PHONY: bootstrap full-deploy ci-local sre-local clean clean-load
 bootstrap: registry-up cluster-up ## Start registry and bootstrap cluster
 
 full-deploy: docker-build-push deploy smoke-test ## Build, push, deploy, and smoke test
@@ -311,5 +351,18 @@ ci-local: ## Simulate the CI pipeline locally
 	@$(MAKE) security || true
 	@echo "CI simulation complete"
 
+sre-local: ## Full SRE local workflow: monitoring, load SLO gate, and SLO report
+	@echo "==> Starting monitoring stack"
+	@$(MAKE) monitoring-up
+	@echo "==> Running SLO validation test"
+	@$(MAKE) load-slo
+	@echo "==> Generating SLO report"
+	@$(MAKE) slo-report
+	@echo "SRE workflow complete"
+
 clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR) coverage.out coverage.html
+
+clean-load: ## Remove load test results
+	rm -rf tests/load/results/*.json tests/load/results/*.html
+	@echo "Load test results cleared"

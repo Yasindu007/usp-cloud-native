@@ -1,0 +1,85 @@
+# ============================================================
+# SLO Recording Rules - 30-day error budget tracking
+#
+# The existing recording_rules.yml file owns short-window latency,
+# availability, cache, and throughput rules. This file adds only the
+# rolling 30-day budget calculations consumed by slo-report.sh and the
+# SLO error-budget dashboard.
+# ============================================================
+
+groups:
+  - name: urlshortener.slo.30d
+    interval: 5m
+    rules:
+      # Error budget consumed (fraction of 30-day request budget used).
+      # 0.0 = none consumed, 1.0 = fully consumed, >1.0 = over budget.
+
+      # SLO-01: Redirect availability (99.95% target, budget = 0.0005).
+      - record: slo:redirect_error_budget_consumed:ratio_30d
+        expr: |
+          sum(increase(urlshortener_http_requests_total{
+            service="redirect-service",
+            status_code=~"5.."
+          }[30d]))
+          /
+          (sum(increase(urlshortener_http_requests_total{
+            service="redirect-service"
+          }[30d])) * 0.0005)
+
+      # SLO-02: API availability (99.9% target, budget = 0.001).
+      - record: slo:api_error_budget_consumed:ratio_30d
+        expr: |
+          sum(increase(urlshortener_http_requests_total{
+            service="api-service",
+            status_code=~"5.."
+          }[30d]))
+          /
+          (sum(increase(urlshortener_http_requests_total{
+            service="api-service"
+          }[30d])) * 0.001)
+
+      # Error budget remaining (inverted, more intuitive for dashboards).
+      - record: slo:redirect_error_budget_remaining:ratio_30d
+        expr: |
+          1 - slo:redirect_error_budget_consumed:ratio_30d
+
+      - record: slo:api_error_budget_remaining:ratio_30d
+        expr: |
+          1 - slo:api_error_budget_consumed:ratio_30d
+
+      # Availability ratios for SLO status summaries.
+      - record: slo:redirect_availability:ratio_30d
+        expr: |
+          1 - (
+            sum(increase(urlshortener_http_requests_total{
+              service="redirect-service",
+              status_code=~"5.."
+            }[30d]))
+            /
+            sum(increase(urlshortener_http_requests_total{
+              service="redirect-service"
+            }[30d]))
+          )
+
+      - record: slo:api_availability:ratio_30d
+        expr: |
+          1 - (
+            sum(increase(urlshortener_http_requests_total{
+              service="api-service",
+              status_code=~"5.."
+            }[30d]))
+            /
+            sum(increase(urlshortener_http_requests_total{
+              service="api-service"
+            }[30d]))
+          )
+
+      # 30 days = 43,200 minutes. Budget minutes are SLO error budget
+      # fraction multiplied by the total window.
+      - record: slo:redirect_error_budget_minutes_remaining:30d
+        expr: |
+          slo:redirect_error_budget_remaining:ratio_30d * 43200 * 0.0005
+
+      - record: slo:api_error_budget_minutes_remaining:30d
+        expr: |
+          slo:api_error_budget_remaining:ratio_30d * 43200 * 0.001

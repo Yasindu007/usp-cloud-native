@@ -1,0 +1,175 @@
+{
+  "title": "k6 Load Test Results",
+  "uid": "k6-load-tests",
+  "description": "Real-time k6 load test metrics from InfluxDB",
+  "tags": ["k6", "load-test"],
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active VUs",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 100 }
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "query": "SELECT last(\"value\") FROM \"vus\" WHERE $timeFilter",
+        "rawQuery": true
+      }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Request Rate (RPS)",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "red", "value": null },
+            { "color": "yellow", "value": 1000 },
+            { "color": "green", "value": 2000 }
+          ]}
+        }
+      },
+      "options": { "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "query": "SELECT non_negative_derivative(max(\"value\"), 1s) AS \"rps\" FROM \"http_reqs\" WHERE $timeFilter GROUP BY time(5s) fill(0)",
+        "rawQuery": true
+      }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "P99 Latency (redirect)",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 30 },
+            { "color": "red", "value": 50 }
+          ]}
+        }
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "query": "SELECT percentile(\"value\", 99) FROM \"http_req_duration\" WHERE \"name\" = 'redirect' AND $timeFilter GROUP BY time(15s)",
+        "rawQuery": true
+      }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Error Rate",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 0.001 },
+            { "color": "red", "value": 0.005 }
+          ]}
+        }
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{
+        "query": "SELECT mean(\"value\") FROM \"http_req_failed\" WHERE $timeFilter GROUP BY time(15s)",
+        "rawQuery": true
+      }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request Latency Percentiles (redirect)",
+      "description": "P50 / P95 / P99 latency. Red line = 50ms SLO boundary.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } },
+        "overrides": [{ "matcher": { "id": "byName", "options": "P99" },
+          "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" }}]
+        }]
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } },
+      "targets": [
+        { "query": "SELECT percentile(\"value\", 50) AS \"P50\" FROM \"http_req_duration\" WHERE \"name\"='redirect' AND $timeFilter GROUP BY time(5s)", "rawQuery": true, "alias": "P50" },
+        { "query": "SELECT percentile(\"value\", 95) AS \"P95\" FROM \"http_req_duration\" WHERE \"name\"='redirect' AND $timeFilter GROUP BY time(5s)", "rawQuery": true, "alias": "P95" },
+        { "query": "SELECT percentile(\"value\", 99) AS \"P99\" FROM \"http_req_duration\" WHERE \"name\"='redirect' AND $timeFilter GROUP BY time(5s)", "rawQuery": true, "alias": "P99" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "VUs and RPS Over Time",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "VUs" }, "properties": [{ "id": "unit", "value": "none" }, { "id": "custom.axisPlacement", "value": "right" }] },
+          { "matcher": { "id": "byName", "options": "RPS" }, "properties": [{ "id": "unit", "value": "reqps" }] }
+        ]
+      },
+      "targets": [
+        { "query": "SELECT non_negative_derivative(max(\"value\"),1s) AS \"RPS\" FROM \"http_reqs\" WHERE $timeFilter GROUP BY time(5s) fill(0)", "rawQuery": true, "alias": "RPS" },
+        { "query": "SELECT last(\"value\") AS \"VUs\" FROM \"vus\" WHERE $timeFilter GROUP BY time(5s) fill(previous)", "rawQuery": true, "alias": "VUs" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Latency Percentiles — API Write (shorten)",
+      "description": "P99 SLO boundary = 200ms",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } },
+        "overrides": [{ "matcher": { "id": "byName", "options": "P99" },
+          "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" }}]
+        }]
+      },
+      "targets": [
+        { "query": "SELECT percentile(\"value\", 50) AS \"P50\" FROM \"http_req_duration\" WHERE \"name\"='shorten' AND $timeFilter GROUP BY time(5s)", "rawQuery": true, "alias": "P50" },
+        { "query": "SELECT percentile(\"value\", 99) AS \"P99\" FROM \"http_req_duration\" WHERE \"name\"='shorten' AND $timeFilter GROUP BY time(5s)", "rawQuery": true, "alias": "P99" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Custom Metric — Cache Hit/Miss Counts",
+      "description": "Inferred from timing: < 5ms = cache hit, >= 5ms = cache miss",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Hits" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" }}] },
+          { "matcher": { "id": "byName", "options": "Misses" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" }}] }
+        ]
+      },
+      "targets": [
+        { "query": "SELECT non_negative_derivative(max(\"value\"),1s) FROM \"redirect_cache_hits\" WHERE $timeFilter GROUP BY time(5s) fill(0)", "rawQuery": true, "alias": "Hits" },
+        { "query": "SELECT non_negative_derivative(max(\"value\"),1s) FROM \"redirect_cache_misses\" WHERE $timeFilter GROUP BY time(5s) fill(0)", "rawQuery": true, "alias": "Misses" }
+      ]
+    }
+  ],
+  "version": 1
+}

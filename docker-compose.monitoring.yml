@@ -36,6 +36,7 @@ services:
     volumes:
       - ./deployments/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deployments/monitoring/recording_rules.yml:/etc/prometheus/recording_rules.yml:ro
+      - ./deployments/monitoring/slo_recording_rules.yml:/etc/prometheus/slo_recording_rules.yml:ro
       - ./deployments/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     networks:

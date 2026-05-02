@@ -1,0 +1,15 @@
+# Grafana datasource provisioning for k6 metrics.
+# The k6 stack uses InfluxDB 1.8 because k6's built-in influxdb output
+# targets the v1 API.
+
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB k6
+    type: influxdb
+    uid: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    database: k6
+    isDefault: true
+    editable: false

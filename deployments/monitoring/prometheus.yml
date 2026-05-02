@@ -30,6 +30,7 @@ global:
 # Load alerting and recording rules.
 rule_files:
   - "recording_rules.yml"
+  - "slo_recording_rules.yml"
   - "alerts.yml"
 
 # Alertmanager configuration (Phase 4: configure real Alertmanager).
