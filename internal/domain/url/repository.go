@@ -92,8 +92,8 @@ type CachePort interface {
 // and prevents parameter order bugs.
 type ListFilter struct {
 	WorkspaceID string
-	Status      *Status    // nil = all statuses
-	CreatedBy   *string    // nil = all creators
-	Cursor      string     // empty = first page
-	Limit       int        // 0 = default (20), max 100
+	Status      *Status // nil = all statuses
+	CreatedBy   *string // nil = all creators
+	Cursor      string  // empty = first page
+	Limit       int     // 0 = default (20), max 100
 }

@@ -1,0 +1,58 @@
+# Monthly SLO report generated from Prometheus when PROMETHEUS_URL is configured.
+name: SLO Report
+
+on:
+  schedule:
+    - cron: '0 9 1 * *'
+  workflow_dispatch:
+
+jobs:
+  slo-report:
+    name: Generate SLO Report
+    runs-on: ubuntu-latest
+    env:
+      PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Build report
+        run: |
+          set -euo pipefail
+          report="slo-report.md"
+          {
+            echo "# URL Shortener SLO Report"
+            echo
+            echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+          } > "$report"
+
+          if [ -z "${PROMETHEUS_URL:-}" ]; then
+            echo "PROMETHEUS_URL is not configured; report contains no live query data." >> "$report"
+            exit 0
+          fi
+
+          query() {
+            local name="$1"
+            local promql="$2"
+            local value
+            value="$(curl -fsG "${PROMETHEUS_URL%/}/api/v1/query" --data-urlencode "query=${promql}" | jq -r '.data.result[0].value[1] // "n/a"')"
+            printf -- "- %s: %s\n" "$name" "$value" >> "$report"
+          }
+
+          query "API availability, 30d" 'urlshortener:api_availability:30d'
+          query "Redirector availability, 30d" 'urlshortener:redirector_availability:30d'
+          query "p95 API latency, 30d" 'urlshortener:api_latency_p95:30d'
+          query "p95 redirect latency, 30d" 'urlshortener:redirect_latency_p95:30d'
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: slo-report
+          path: slo-report.md
+          retention-days: 90
+
+      - name: Post report to Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          text="$(sed ':a;N;$!ba;s/\n/\\n/g' slo-report.md)"
+          curl -fsS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"${text}\"}" "$SLACK_WEBHOOK_URL"

@@ -61,6 +61,7 @@ func main() {
 		slog.String("service", cfg.ServiceName),
 		slog.String("version", version),
 		slog.String("commit", commit),
+		slog.String("build_time", buildTime),
 		slog.String("env", cfg.Environment),
 	)
 	slog.SetDefault(log)

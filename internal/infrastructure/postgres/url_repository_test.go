@@ -20,8 +20,8 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/urlshortener/platform/internal/config"
-	domainworkspace "github.com/urlshortener/platform/internal/domain/workspace"
 	"github.com/urlshortener/platform/internal/domain/url"
+	domainworkspace "github.com/urlshortener/platform/internal/domain/workspace"
 	"github.com/urlshortener/platform/internal/infrastructure/postgres"
 )
 

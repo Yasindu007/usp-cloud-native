@@ -7,9 +7,9 @@
 //   - http/       — chi HTTP router, handlers, middleware chain
 //
 // The HTTP handler's only job is:
-//   1. Parse and validate the HTTP request (input deserialization)
-//   2. Call the application use case handler
-//   3. Serialize the result to HTTP response (output serialization)
+//  1. Parse and validate the HTTP request (input deserialization)
+//  2. Call the application use case handler
+//  3. Serialize the result to HTTP response (output serialization)
 //
 // Handlers must never contain business logic.
 // Business logic belongs in the application or domain layer.

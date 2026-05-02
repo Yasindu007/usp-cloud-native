@@ -23,7 +23,7 @@ NAMESPACE    := urlshortener
 
 GIT_SHA  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
 GIT_TAG  := $(shell git describe --tags --always 2>/dev/null || echo "v0.0.0-dev")
-BUILD_TS := $(shell git log -1 --format=%cI 2>/dev/null || echo "unknown")
+BUILD_TS := $(shell git log -1 --format=%cI 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 LDFLAGS := -s -w \
 	-X main.version=$(GIT_TAG) \
@@ -57,7 +57,7 @@ run-redirector: ## Run redirector locally
 run-issuer: ## Run local mock JWT issuer
 	go run ./cmd/mockissuer
 
-.PHONY: test test-unit test-integration test-coverage
+.PHONY: test test-unit test-integration test-all test-coverage
 test: test-unit ## Run unit tests
 
 test-unit: ## Run unit tests with race detector
@@ -66,9 +66,14 @@ test-unit: ## Run unit tests with race detector
 test-integration: ## Run integration tests
 	go test -v -race -count=1 -tags=integration ./...
 
+test-all: ## Run unit and integration tests
+	go test -v -race -count=1 ./...
+	go test -v -race -count=1 -tags=integration ./...
+
 test-coverage: ## Generate coverage report
 	go test -v -race -count=1 -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
+	@echo "Report: coverage.html"
 
 .PHONY: fmt vet lint tidy check
 fmt: ## Format Go files
@@ -78,13 +83,25 @@ vet: ## Run go vet
 	go vet ./...
 
 lint: ## Run golangci-lint
-	golangci-lint run --timeout=5m ./...
+	golangci-lint run --config=.golangci.yml --timeout=5m ./...
 
 tidy: ## Tidy and verify modules
 	go mod tidy
 	go mod verify
 
 check: fmt vet lint ## Run formatting, vet, and lint
+
+.PHONY: security govulncheck trivy
+security: govulncheck trivy ## Run Go and container security checks
+
+govulncheck: ## Check Go modules for known vulnerabilities
+	go install golang.org/x/vuln/cmd/govulncheck@latest
+	govulncheck ./...
+
+trivy: ## Scan service images with Trivy
+	trivy image --severity CRITICAL,HIGH $(REGISTRY)/urlshortener/api:latest
+	trivy image --severity CRITICAL,HIGH $(REGISTRY)/urlshortener/redirector:latest
+	trivy image --severity CRITICAL,HIGH $(REGISTRY)/urlshortener/migrate:latest
 
 .PHONY: infra-up infra-down infra-destroy infra-logs monitoring-up monitoring-down
 infra-up: ## Start PostgreSQL and Redis
@@ -101,6 +118,8 @@ infra-logs: ## Tail PostgreSQL and Redis logs
 
 monitoring-up: ## Start local Prometheus and Grafana
 	docker compose -f docker-compose.monitoring.yml up -d
+	@echo "Prometheus: http://localhost:9095"
+	@echo "Grafana:    http://localhost:3000"
 
 monitoring-down: ## Stop local Prometheus and Grafana
 	docker compose -f docker-compose.monitoring.yml down
@@ -122,6 +141,7 @@ registry-up: ## Start local registry
 	else \
 		docker compose -f docker-compose.registry.yml up -d; \
 	fi
+	@echo "Registry: http://$(REGISTRY)"
 
 registry-down: ## Stop local registry
 	@if docker inspect urlshortener-registry >/dev/null 2>&1; then \
@@ -180,7 +200,7 @@ secrets-backup: ## Export the Sealed Secrets controller key
 		-o yaml > sealing-key-backup-$(GIT_SHA).yaml
 	@echo "Sealing key backed up to sealing-key-backup-$(GIT_SHA).yaml"
 
-.PHONY: deploy deploy-api deploy-redirector rollback rollback-api rollback-redirector
+.PHONY: deploy deploy-api deploy-redirector rollback rollback-api rollback-redirector smoke-test
 deploy: ## Deploy all services to Kubernetes
 	$(SHELL) scripts/deploy.sh --image-tag $(GIT_SHA)
 
@@ -197,14 +217,16 @@ deploy-redirector: ## Rolling update redirector image
 	kubectl rollout status deployment/redirector -n $(NAMESPACE) --timeout=5m
 
 rollback: ## Roll back api and redirector deployments
-	kubectl rollout undo deployment/api -n $(NAMESPACE)
-	kubectl rollout undo deployment/redirector -n $(NAMESPACE)
+	$(SHELL) scripts/rollback.sh
 
 rollback-api: ## Roll back api deployment
 	kubectl rollout undo deployment/api -n $(NAMESPACE)
 
 rollback-redirector: ## Roll back redirector deployment
 	kubectl rollout undo deployment/redirector -n $(NAMESPACE)
+
+smoke-test: ## Run smoke tests against the local cluster ingress
+	$(SHELL) scripts/smoke-test.sh http://api.shortener.local http://r.shortener.local
 
 .PHONY: hpa-status pdb-status scale-status load-test-hpa
 hpa-status: ## Show HorizontalPodAutoscaler status
@@ -260,10 +282,10 @@ wso2-shell: ## Open a shell inside the WSO2 container
 setup-hosts: ## Add required local ingress hostnames to /etc/hosts
 ifeq ($(OS),Windows_NT)
 	@echo "Add this line to C:\\Windows\\System32\\drivers\\etc\\hosts as Administrator:"
-	@echo "127.0.0.1 api.shortener.local r.shortener.local"
+	@echo "127.0.0.1 api.shortener.local r.shortener.local api.staging.shortener.local r.staging.shortener.local"
 else
 	@if ! grep -q "api.shortener.local" /etc/hosts; then \
-		echo "127.0.0.1 api.shortener.local r.shortener.local" | sudo tee -a /etc/hosts; \
+		echo "127.0.0.1 api.shortener.local r.shortener.local api.staging.shortener.local r.staging.shortener.local" | sudo tee -a /etc/hosts; \
 		echo "Added DNS entries"; \
 	else \
 		echo "DNS entries already present"; \
@@ -273,10 +295,21 @@ endif
 .PHONY: wso2-start
 wso2-start: wso2-up wso2-wait wso2-seed ## Start WSO2 and seed APIs
 
-.PHONY: bootstrap full-deploy clean
+.PHONY: bootstrap full-deploy ci-local clean
 bootstrap: registry-up cluster-up ## Start registry and bootstrap cluster
 
-full-deploy: docker-build-push deploy ## Build, push, and deploy
+full-deploy: docker-build-push deploy smoke-test ## Build, push, deploy, and smoke test
+
+ci-local: ## Simulate the CI pipeline locally
+	@echo "==> Lint and static checks"
+	@$(MAKE) check
+	@echo "==> Unit tests"
+	@$(MAKE) test-unit
+	@echo "==> Docker build"
+	@$(MAKE) docker-build
+	@echo "==> Security scan"
+	@$(MAKE) security || true
+	@echo "CI simulation complete"
 
 clean: ## Remove build artifacts
 	rm -rf $(BUILD_DIR) coverage.out coverage.html

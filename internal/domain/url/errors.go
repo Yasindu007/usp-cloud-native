@@ -11,9 +11,10 @@ import "errors"
 // database concerns out of the handler.
 //
 // Error mapping example:
-//   infrastructure/postgres: pgx.ErrNoRows       → domain.ErrNotFound
-//   interfaces/http handler: domain.ErrNotFound  → HTTP 404
-//   interfaces/http handler: domain.ErrConflict  → HTTP 409
+//
+//	infrastructure/postgres: pgx.ErrNoRows       → domain.ErrNotFound
+//	interfaces/http handler: domain.ErrNotFound  → HTTP 404
+//	interfaces/http handler: domain.ErrConflict  → HTTP 409
 var (
 	// ErrNotFound is returned when a URL cannot be found by its lookup key.
 	ErrNotFound = errors.New("url: not found")

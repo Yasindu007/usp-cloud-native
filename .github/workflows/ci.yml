@@ -1,0 +1,235 @@
+# CI Pipeline - lint, test, build, and scan the URL shortener services.
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/pull_request_template.md'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.9'
+  REGISTRY: localhost:5001
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify module files are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum || {
+            echo "go.mod/go.sum changed; run go mod tidy locally."
+            exit 1
+          }
+
+      - name: Check formatting
+        run: |
+          # Only check tracked Go files so local temp files, generated scratch
+          # files, and frontend dependencies cannot fail the backend pipeline.
+          unformatted="$(git ls-files '*.go' | xargs gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m --config=.golangci.yml ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: urlshortener
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: urlshortener_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run unit tests
+        run: |
+          go test -v -race -count=1 -short -coverprofile=coverage.out ./...
+
+      - name: Run integration tests
+        env:
+          DB_PRIMARY_DSN: postgresql://urlshortener:testpassword@localhost:5432/urlshortener_test?sslmode=disable
+          DB_REPLICA_DSN: postgresql://urlshortener:testpassword@localhost:5432/urlshortener_test?sslmode=disable
+          REDIS_ADDR: localhost:6379
+          REDIS_PASSWORD: ''
+          ENVIRONMENT: test
+        run: |
+          go run ./cmd/migrate up
+          go test -v -race -count=1 -tags=integration ./internal/infrastructure/...
+
+      - name: Check coverage threshold
+        run: |
+          go tool cover -func=coverage.out
+          coverage="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')"
+          # Start from the repository's current baseline and raise this as
+          # coverage improves. This still catches accidental large regressions.
+          awk -v coverage="$coverage" 'BEGIN { if (coverage < 30) exit 1 }' || {
+            echo "Coverage ${coverage}% is below the 30% threshold."
+            exit 1
+          }
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 7
+
+  build:
+    name: Build Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract build metadata
+        id: meta
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build service images
+        run: bash scripts/build-images.sh "${{ steps.meta.outputs.sha }}"
+
+      - name: Save images for scanning and deployment
+        run: |
+          docker save "${REGISTRY}/urlshortener/api:${{ steps.meta.outputs.sha }}" -o /tmp/api-image.tar
+          docker save "${REGISTRY}/urlshortener/redirector:${{ steps.meta.outputs.sha }}" -o /tmp/redirector-image.tar
+          docker save "${REGISTRY}/urlshortener/migrate:${{ steps.meta.outputs.sha }}" -o /tmp/migrate-image.tar
+
+      - name: Upload image archives
+        uses: actions/upload-artifact@v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          name: docker-images-${{ steps.meta.outputs.sha }}
+          path: |
+            /tmp/api-image.tar
+            /tmp/redirector-image.tar
+            /tmp/migrate-image.tar
+          retention-days: 1
+
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image archives
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images-${{ needs.build.outputs.image_tag }}
+          path: /tmp
+
+      - name: Load images
+        run: |
+          docker load -i /tmp/api-image.tar
+          docker load -i /tmp/redirector-image.tar
+          docker load -i /tmp/migrate-image.tar
+
+      - name: Scan api image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/urlshortener/api:${{ needs.build.outputs.image_tag }}
+          format: sarif
+          output: trivy-api.sarif
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Scan redirector image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/urlshortener/redirector:${{ needs.build.outputs.image_tag }}
+          format: sarif
+          output: trivy-redirector.sarif
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: |
+            trivy-api.sarif
+            trivy-redirector.sarif
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: ${{ env.GO_VERSION }}
+          go-package: ./...

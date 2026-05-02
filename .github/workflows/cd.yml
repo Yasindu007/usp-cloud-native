@@ -1,0 +1,92 @@
+# CD Pipeline - publish images, deploy, smoke test, and roll back on failure.
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: localhost:5001
+  NAMESPACE: urlshortener
+  STAGING_NAMESPACE: urlshortener-staging
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Checkout deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Restore kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          if [ -n "$KUBECONFIG_B64" ]; then
+            echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          else
+            echo "KUBECONFIG_B64 is required for deployments."
+            exit 1
+          fi
+
+      - name: Resolve image tag
+        id: image
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download built images from CI
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: docker-images-${{ steps.image.outputs.tag }}
+          path: /tmp
+
+      - name: Load and push images
+        run: |
+          docker load -i /tmp/api-image.tar
+          docker load -i /tmp/redirector-image.tar
+          docker load -i /tmp/migrate-image.tar
+          bash scripts/push-images.sh "${{ steps.image.outputs.tag }}"
+
+      - name: Capture current production revisions
+        id: pre_deploy
+        run: |
+          echo "api_revision=$(kubectl rollout history deployment/api -n "$NAMESPACE" | awk 'NF && $1 ~ /^[0-9]+$/ {rev=$1} END {print rev+0}')" >> "$GITHUB_OUTPUT"
+          echo "redirector_revision=$(kubectl rollout history deployment/redirector -n "$NAMESPACE" | awk 'NF && $1 ~ /^[0-9]+$/ {rev=$1} END {print rev+0}')" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to staging
+        env:
+          NAMESPACE: ${{ env.STAGING_NAMESPACE }}
+        run: bash scripts/deploy.sh --image-tag "${{ steps.image.outputs.tag }}"
+
+      - name: Smoke test staging
+        env:
+          API_URL: ${{ vars.STAGING_API_URL || 'http://api.staging.shortener.local' }}
+          REDIRECT_URL: ${{ vars.STAGING_REDIRECT_URL || 'http://r.staging.shortener.local' }}
+        run: bash scripts/smoke-test.sh "$API_URL" "$REDIRECT_URL"
+
+      - name: Deploy to production
+        run: bash scripts/deploy.sh --image-tag "${{ steps.image.outputs.tag }}"
+
+      - name: Verify production
+        env:
+          API_URL: ${{ vars.PROD_API_URL || 'http://api.shortener.local' }}
+          REDIRECT_URL: ${{ vars.PROD_REDIRECT_URL || 'http://r.shortener.local' }}
+        run: bash scripts/smoke-test.sh "$API_URL" "$REDIRECT_URL"
+
+      - name: Roll back production on failure
+        if: failure()
+        env:
+          API_REVISION: ${{ steps.pre_deploy.outputs.api_revision }}
+          REDIRECTOR_REVISION: ${{ steps.pre_deploy.outputs.redirector_revision }}
+        run: bash scripts/rollback.sh "$API_REVISION" "$REDIRECTOR_REVISION"

@@ -6,13 +6,14 @@ import "errors"
 // The HTTP middleware translates these to RFC 7807 Problem Details responses.
 //
 // Error mapping:
-//   ErrMissingToken    → 401 Unauthorized (no Authorization header)
-//   ErrInvalidToken    → 401 Unauthorized (malformed, bad signature)
-//   ErrTokenExpired    → 401 Unauthorized (exp claim in the past)
-//   ErrTokenRevoked    → 401 Unauthorized (JTI in deny list)
-//   ErrInvalidIssuer   → 401 Unauthorized (iss claim mismatch)
-//   ErrInvalidAudience → 401 Unauthorized (aud claim mismatch)
-//   ErrInsufficientScope → 403 Forbidden (valid token, wrong scope)
+//
+//	ErrMissingToken    → 401 Unauthorized (no Authorization header)
+//	ErrInvalidToken    → 401 Unauthorized (malformed, bad signature)
+//	ErrTokenExpired    → 401 Unauthorized (exp claim in the past)
+//	ErrTokenRevoked    → 401 Unauthorized (JTI in deny list)
+//	ErrInvalidIssuer   → 401 Unauthorized (iss claim mismatch)
+//	ErrInvalidAudience → 401 Unauthorized (aud claim mismatch)
+//	ErrInsufficientScope → 403 Forbidden (valid token, wrong scope)
 //
 // We return 401 for all token validity failures — not 403. This is
 // intentional: 403 means "authenticated but not authorized." Token

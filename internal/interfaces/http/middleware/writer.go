@@ -9,20 +9,23 @@ import "net/http"
 // the response status code written by downstream handlers.
 //
 // Problem it solves:
-//   http.ResponseWriter does not expose the written status code after the
-//   fact. Middleware that needs to log or record the response status (like
-//   a request logger or an OTel span recorder) must wrap the writer to
-//   intercept the WriteHeader call.
+//
+//	http.ResponseWriter does not expose the written status code after the
+//	fact. Middleware that needs to log or record the response status (like
+//	a request logger or an OTel span recorder) must wrap the writer to
+//	intercept the WriteHeader call.
 //
 // Thread safety:
-//   This wrapper is not concurrent-safe but does not need to be — a single
-//   HTTP request is served by a single goroutine in the standard library.
+//
+//	This wrapper is not concurrent-safe but does not need to be — a single
+//	HTTP request is served by a single goroutine in the standard library.
 //
 // Compatibility:
-//   Only http.ResponseWriter is implemented. If the original writer
-//   implements http.Flusher or http.Hijacker (for SSE/WebSocket),
-//   callers should type-assert the original writer directly. For Phase 1
-//   (REST only), this wrapper is sufficient.
+//
+//	Only http.ResponseWriter is implemented. If the original writer
+//	implements http.Flusher or http.Hijacker (for SSE/WebSocket),
+//	callers should type-assert the original writer directly. For Phase 1
+//	(REST only), this wrapper is sufficient.
 type statusResponseWriter struct {
 	http.ResponseWriter
 	status  int

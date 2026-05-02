@@ -1,0 +1,70 @@
+# Scheduled security checks that are useful even when code has not changed.
+name: Security
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.25.9'
+  REGISTRY: localhost:5001
+
+jobs:
+  security:
+    name: Go and Container Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: ${{ env.GO_VERSION }}
+          go-package: ./...
+
+      - name: Build images for scheduled scan
+        run: bash scripts/build-images.sh scheduled
+
+      - name: Scan api image
+        uses: aquasecurity/trivy-action@master
+        if: ${{ env.ACT != 'true' }}
+        with:
+          image-ref: ${{ env.REGISTRY }}/urlshortener/api:scheduled
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+
+      - name: Scan redirector image
+        uses: aquasecurity/trivy-action@master
+        if: ${{ env.ACT != 'true' }}
+        with:
+          image-ref: ${{ env.REGISTRY }}/urlshortener/redirector:scheduled
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        if: ${{ env.ACT != 'true' }}
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        if: ${{ env.ACT != 'true' }}
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 30

@@ -25,11 +25,12 @@ import "time"
 // responsible for nothing beyond orchestration.
 //
 // Validation philosophy:
-//   Structural validation (is this a non-empty string?) belongs in the
-//   HTTP handler or input parsing layer.
-//   Business validation (is this URL scheme allowed? is the short code
-//   reserved?) belongs in this use case handler.
-//   Domain invariant enforcement (click_count >= 0) belongs in the entity.
+//
+//	Structural validation (is this a non-empty string?) belongs in the
+//	HTTP handler or input parsing layer.
+//	Business validation (is this URL scheme allowed? is the short code
+//	reserved?) belongs in this use case handler.
+//	Domain invariant enforcement (click_count >= 0) belongs in the entity.
 type Command struct {
 	// OriginalURL is the long URL to be shortened.
 	// Must be a valid RFC 3986 URL with http or https scheme.

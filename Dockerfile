@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG GO_VERSION=1.22
+ARG GO_VERSION=1.25
 ARG SERVICE=api
 
 FROM golang:${GO_VERSION}-alpine AS deps

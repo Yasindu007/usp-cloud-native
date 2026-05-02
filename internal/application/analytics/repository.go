@@ -6,16 +6,18 @@ import "context"
 // Implemented by infrastructure/postgres.AnalyticsRepository.
 //
 // Write path design:
-//   WriteMany is the primary write method. The ingestion service buffers
-//   events and calls WriteMany in batches. Single-event Write is provided
-//   for operational use (testing, low-volume writes) but is not called
-//   from the hot path.
+//
+//	WriteMany is the primary write method. The ingestion service buffers
+//	events and calls WriteMany in batches. Single-event Write is provided
+//	for operational use (testing, low-volume writes) but is not called
+//	from the hot path.
 //
 // Read path:
-//   Read methods are defined here for future use by Story 3.2
-//   (Analytics Aggregation API). They are NOT implemented in Story 3.1.
-//   Defining the interface now prevents the Story 3.2 implementation from
-//   needing to change the domain layer.
+//
+//	Read methods are defined here for future use by Story 3.2
+//	(Analytics Aggregation API). They are NOT implemented in Story 3.1.
+//	Defining the interface now prevents the Story 3.2 implementation from
+//	needing to change the domain layer.
 type Repository interface {
 	// WriteMany inserts a batch of redirect events in a single round-trip.
 	// Batch size is controlled by the ingestion service (default: 100 events).

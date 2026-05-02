@@ -10,10 +10,11 @@
 //     request-scoped fields (request_id, user_id, workspace_id)
 //
 // Tradeoff vs zap:
-//   zap offers ~3x lower allocation rate and better performance for
-//   very high-throughput services. For the redirect hot path at 10k RPS,
-//   we will profile in Phase 4 and migrate if log allocation shows up
-//   in pprof. For now, slog's zero-dependency simplicity wins.
+//
+//	zap offers ~3x lower allocation rate and better performance for
+//	very high-throughput services. For the redirect hot path at 10k RPS,
+//	we will profile in Phase 4 and migrate if log allocation shows up
+//	in pprof. For now, slog's zero-dependency simplicity wins.
 package logger
 
 import (

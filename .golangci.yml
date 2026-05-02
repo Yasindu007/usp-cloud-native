@@ -1,0 +1,41 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - gofmt
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+
+linters-settings:
+  gofmt:
+    simplify: true
+  gosec:
+    excludes:
+      # G101 is noisy for domain constants containing words like "token" and
+      # "apikey"; G112/G115/G306 are reviewed separately during hardening.
+      - G101
+      - G112
+      - G115
+      - G306
+      - G404
+
+issues:
+  exclude-dirs:
+    - bin
+    - tmp
+    - .tmp
+    - frontend
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+        - staticcheck
+        - unused
